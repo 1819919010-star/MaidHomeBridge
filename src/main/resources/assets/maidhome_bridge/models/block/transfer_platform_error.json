@@ -1,0 +1,6 @@
+{
+  "parent": "maidhome_bridge:block/transfer_platform",
+  "textures": {
+    "energy": "maidhome_bridge:block/platform_energy_error"
+  }
+}
