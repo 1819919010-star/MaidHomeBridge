@@ -16,5 +16,6 @@ src/smoke/
 _original_template_backup*/
 .maidhome-bridge-installed
 !gradle/wrapper/gradle-wrapper.jar
-!libs/*.jar
-!libs/optional/*.jar
+libs/
+licenses/
+src/freezeSmoke/

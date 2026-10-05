@@ -43,6 +43,13 @@ public final class TransferPlatformBlock extends BaseEntityBlock {
     @Override public <T extends BlockEntity> BlockEntityTicker<T> getTicker(Level l, BlockState s, BlockEntityType<T> type) {
         return l.isClientSide ? null : createTickerHelper(type, PlatformContent.ENTITY.get(), PlatformBlockEntity::tick);
     }
+    @Override protected void onRemove(BlockState state,Level level,BlockPos pos,BlockState replacement,boolean moving) {
+        if(!state.is(replacement.getBlock())&&!level.isClientSide&&level.getBlockEntity(pos) instanceof PlatformBlockEntity platform) {
+            var registry=ReceiverRegistry.get(((net.minecraft.server.level.ServerLevel)level).getServer());
+            if(registry.matches(platform))registry.clear();
+        }
+        super.onRemove(state,level,pos,replacement,moving);
+    }
     @Override protected InteractionResult useWithoutItem(BlockState state, Level level, BlockPos pos, Player player, BlockHitResult hit) {
         if (player instanceof ServerPlayer server && level.getBlockEntity(pos) instanceof PlatformBlockEntity platform)
             server.openMenu(new SimpleMenuProvider((id,inv,p) -> new PlatformMenu(id,inv,pos,platform.identity),

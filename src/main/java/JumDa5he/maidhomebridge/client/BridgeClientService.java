@@ -9,9 +9,6 @@ import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
 import com.google.gson.JsonObject;
 import io.github.zgxhzhr.maidfm.network.MaidFilePackets;
 import net.minecraft.client.Minecraft;
-import net.minecraft.network.chat.Component;
-import net.minecraft.network.chat.ClickEvent;
-import net.minecraft.ChatFormatting;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -23,6 +20,7 @@ import java.util.concurrent.atomic.*;
 import java.util.function.Supplier;
 
 public final class BridgeClientService {
+    private static final org.slf4j.Logger LOGGER=org.slf4j.LoggerFactory.getLogger("MaidHomeBridge");
     public static final BridgeClientService INSTANCE = new BridgeClientService();
     private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "MaidHome-client-worker"); t.setDaemon(true); return t;
@@ -41,11 +39,13 @@ public final class BridgeClientService {
     private volatile PendingRemoval removal;
     private volatile boolean cancelRequested;
     private volatile boolean rejectIncoming;
+    private final AtomicReference<String> nextReceiveMode=new AtomicReference<>("import");
     private final ThreadLocal<JsonObject> jobPlatform = new ThreadLocal<>();
     private volatile JsonObject activePlatform;
-    private volatile boolean platformBroken, remoteRisk, unsafeResult;
+    private volatile boolean platformBroken, remoteRisk, unsafeResult, ackWriteStarted;
     private volatile String endpointHost = "127.0.0.1";
     private volatile int endpointPort = 7411;
+    private volatile boolean endpointLoaded;
     private volatile String waitMode = "";
     private volatile long nextPulse;
     private volatile CompletableFuture<JsonObject> pulse;
@@ -53,7 +53,7 @@ public final class BridgeClientService {
     private final ConcurrentHashMap<String, com.google.gson.JsonArray> remoteLists = new ConcurrentHashMap<>();
     private volatile java.util.List<String> diskRecords = java.util.List.of();
     private volatile java.util.List<BridgeNetwork.MaidSummary> ownMaids = java.util.List.of();
-    private record PendingRemoval(UUID ticket, String unityId, String recordKey, String name, String scope, UUID maid) {}
+    private record PendingRemoval(UUID ticket, String unityId, String recordKey, String name, String scope, UUID maid, JsonObject station) {}
     private BridgeClientService() {}
 
     public void select(UUID id) { selected = id; say("已选择女仆 " + id + "；上传时由服务端验证所有权。"); }
@@ -70,9 +70,9 @@ public final class BridgeClientService {
 
     public void connect(String host, int port) {
         run("连接 Unity", () -> {
-            endpointHost = host; endpointPort = port;
+            if (portal != null && portal.connected()) throw new IOException("已经连接，请先断开或使用界面重连");
+            configureEndpoint(host,port);
             remoteLists.clear();
-            if (portal != null && portal.connected()) throw new IOException("已经连接，请先 /maidhome disconnect");
             String context = onClientAsync(BridgeNetwork::requestScope);
             long token = jobGeneration.get();
             Path game = onClient(() -> Minecraft.getInstance().gameDirectory.toPath());
@@ -80,38 +80,31 @@ public final class BridgeClientService {
                     .resolve(SafeFiles.sha256(context.getBytes(StandardCharsets.UTF_8))));
             IncomingTransfer receiving = new IncomingTransfer(storage);
             AtomicReference<PortalClient> connection = new AtomicReference<>();
+            AtomicReference<CompletableFuture<JsonObject>> binding=new AtomicReference<>();
             PortalClient client = new PortalClient(host, port, Duration.ofSeconds(30), new PortalClient.Notifications() {
                 @Override public void frame(PortalFrame frame) throws IOException {
                     if (generation.get() != token) throw new IOException("当前世界已切换");
-                    IncomingTransfer.Receipt receipt = receiving.accept(frame);
-                    if (frame.op().equals("send.end") && receiving.error() != null) {
-                        PortalClient active = connection.get();
-                        if (active == null) throw new IOException("连接尚未初始化");
-                        active.acknowledge(receiving.id(), false, receiving.error());
-                        say("拒绝接收：" + receiving.error()); receiving.clear(); return;
+                    if(frame.op().equals("send.begin")) {
+                        binding.set(busy.get()?CompletableFuture.failedFuture(new IOException("另一项传输正在进行")):beginReceiver(token));
+                        say("正在接收女仆");
                     }
-                    if (receipt != null) {
-                        if (rejectIncoming) {
-                            PortalClient active = connection.get();
-                            if (active == null) throw new IOException("连接尚未初始化");
-                            active.acknowledge(receipt.id(), false, "玩家取消接收");
-                            storage.journal(receipt.key(), storage.find(receipt.key()), "REJECTED");
-                            receiving.clear(); rejectIncoming = false; say("已取消接收，Unity 女仆保留。"); return;
+                    IncomingTransfer.Receipt receipt;
+                    try {receipt=receiving.accept(frame);}
+                    catch(IOException e) {
+                        finishReceiver(binding.get(),"error",e.getMessage());
+                        if(frame.op().equals("send.end")&&connection.get()!=null&&receiving.id()!=null){connection.get().acknowledge(receiving.id(),false,"档案保存或校验失败");receiving.clear();return;}
+                        throw e;
+                    }
+                    if(frame.op().equals("send.end")&&receiving.error()!=null){
+                        connection.get().acknowledge(receiving.id(),false,receiving.error());
+                        finishReceiver(binding.get(),"error",receiving.error());say("接收失败："+receiving.error());receiving.clear();return;
+                    }
+                    if(receipt!=null) {
+                        if(rejectIncoming||busy.get()) {
+                            connection.get().acknowledge(receipt.id(),false,"当前无法接收，请稍后再试");receiving.clear();
+                            finishReceiver(binding.get(),"cancelled","接收已取消");rejectIncoming=false;return;
                         }
-                        try { validateArchive(receipt.archive()); }
-                        catch (IOException e) {
-                            PortalClient active = connection.get();
-                            if (active == null) throw e;
-                            active.acknowledge(receipt.id(), false, e.getMessage());
-                            storage.journal(receipt.key(), storage.find(receipt.key()), "INVALID_ARCHIVE");
-                            receiving.clear(); say("拒绝接收：" + e.getMessage()); return;
-                        }
-                        status = "待确认接收：" + receipt.name();
-                        say("已校验并备份返回档案：" + receipt.name() + "，Unity 尚未删除。请选择：");
-                        clickable("[仅保存，确认接收]", "/maidhome receive save");
-                        clickable("[导入当前世界，成功后确认]", "/maidhome receive import");
-                        clickable("[拒绝，保留 Unity 女仆]", "/maidhome receive reject");
-                        if (receipt.processedBefore()) say("该档案已有导入记录或结果待确认；将阻止重复导入。");
+                        processArrival(connection.get(),receiving,receipt,binding.get(),token,nextReceiveMode.getAndSet("import"));
                     }
                 }
                 @Override public void disconnected(String reason) {
@@ -129,7 +122,7 @@ public final class BridgeClientService {
             if (generation.get() != token) { client.close(); throw new IOException("连接任务已取消"); }
             client.startHeartbeat(this::say);
             status = "已连接 " + host + ":" + port;
-            say(status + "；备份目录：" + storage.root());
+            LOGGER.info("备份目录：{}",storage.root()); say(status);
         });
     }
 
@@ -143,10 +136,10 @@ public final class BridgeClientService {
         generation.incrementAndGet(); cancelRequested = true;
         PackageUploader upload = uploading; if (upload != null) upload.cancel();
         PortalClient client = portal; portal = null; if (client != null) client.close();
-        incoming = null; removal = null; status = "已断开，备份保留";
+        incoming = null; activePlatform=null; nextReceiveMode.set("import"); status = "已断开，备份保留";
         say(status);
     }
-    public void logout() { disconnect(); selected = null; ownMaids=java.util.List.of(); remoteLists.clear(); diskRecords=java.util.List.of(); BridgeNetwork.clearClientState(); }
+    public void logout() { disconnect(); removal=null; selected = null; ownMaids=java.util.List.of(); remoteLists.clear(); diskRecords=java.util.List.of(); BridgeNetwork.clearClientState(); }
     public void resourceReloaded() {
         cancelRequested = true;
         PackageUploader upload = uploading;
@@ -180,6 +173,10 @@ public final class BridgeClientService {
     }
 
     public void receive(String mode) {
+        if(!java.util.Set.of("save","import","reject").contains(mode)){say("接收模式无效");return;}
+        if(jobGeneration.get()==null&&(incoming==null||incoming.ready()==null)) {
+            nextReceiveMode.set(mode);say(switch(mode){case "save"->"下次回传仅保存备份，MaidHome 女仆会保留";case "reject"->"下次回传将拒绝接收";default->"下次回传将导入已启用的接收台";});return;
+        }
         run("确认返回档案", () -> {
             PortalClient client = requirePortal(); IncomingTransfer receiving = incoming;
             IncomingTransfer.Receipt receipt = receiving == null ? null : receiving.ready();
@@ -188,17 +185,18 @@ public final class BridgeClientService {
             JsonObject record = storage.find(receipt.key());
             record.addProperty("unity_id", receipt.id()); record.addProperty("sha256", receipt.hash());
             record.addProperty("directory", receipt.directory().toString());
-            if (mode.equals("reject")) {
+            if (mode.equals("reject") || mode.equals("save")) {
                 storage.journal(receipt.key(), record, "REJECTED");
-                client.acknowledge(receipt.id(), false, "玩家拒绝接收"); receiving.clear();
-                say("已拒绝；Unity 原档案保留，本地备份保留。"); return;
+                client.acknowledge(receipt.id(), false, mode.equals("save")?"仅保存备份，未生成实体":"玩家拒绝接收"); receiving.clear();
+                say("本地备份保留，MaidHome 女仆未移除。"); return;
             }
             validateArchive(receipt.archive());
             if (mode.equals("import")) {
                 boolean priorImport = record.has("imported") && record.get("imported").getAsBoolean()
                         || record.has("state") && java.util.Set.of("IMPORT_INTENT", "IMPORT_RESULT_UNCERTAIN", "IMPORTED", "ACK_RESULT_UNCERTAIN", "ACK_SENT_NO_REPLY")
                         .contains(record.get("state").getAsString());
-                if (receipt.processedBefore() || priorImport) throw new IOException("已有处理记录或结果不确定，已阻止重复生成。请核对两端；可选择仅保存确认。");
+                if (receipt.processedBefore() || priorImport) throw new IOException("同一接收事务已有处理记录，请核对两端，已阻止重复生成");
+                if(activePlatform==null)throw new IOException("请先启用接收台");
                 storage.journal(receipt.key(), record, "IMPORT_INTENT");
                 unsafeResult = true; remoteRisk = true;
                 BridgeNetwork.ImportResult result;
@@ -214,18 +212,20 @@ public final class BridgeClientService {
                     client.acknowledge(receipt.id(), false, result.message()); receiving.clear();
                     throw new IOException("导入被前置拒绝：" + result.message() + "。Unity 女仆保留。");
                 }
+                unsafeResult=true;
                 record.addProperty("imported", true);
                 storage.journal(receipt.key(), record, "IMPORTED");
             } else if (!mode.equals("save")) throw new IOException("接收模式无效");
             SafeFiles.verify(java.nio.file.Files.readAllBytes(receipt.directory().resolve("maid_data.maid")), receipt.hash());
             unsafeResult = true; remoteRisk = true;
             storage.journal(receipt.key(), record, "ACK_RESULT_UNCERTAIN");
-            client.acknowledge(receipt.id(), true, mode.equals("import") ? "MaidFileManager 导入成功" : "玩家确认，档案已可靠保存");
+            ackWriteStarted=true;
+            client.acknowledge(receipt.id(), true, "MaidFileManager 导入成功");
             receiving.clear();
             storage.journal(receipt.key(), record, "ACK_SENT_NO_REPLY");
             unsafeResult = false;
-            say((mode.equals("import") ? "已导入世界并发送接收确认。" : "已保存并发送接收确认。")
-                    + "协议不返回 ACK 应答；请在 Unity 面板确认移除结果。档案：" + receipt.directory());
+            LOGGER.info("返回备份：{}；ACK 无应答，需在 MaidHome 核对删除结果",receipt.directory());
+            say("已导入台面；请在 MaidHome 确认原存档已移除");
         });
     }
 
@@ -236,21 +236,29 @@ public final class BridgeClientService {
             JsonObject record = store.find(pending.recordKey);
             unsafeResult = true; remoteRisk = true;
             store.journal(pending.recordKey, record, "REMOVAL_RESULT_UNCERTAIN");
-            removal = null;
+            onClientAsync(() -> BridgeNetwork.requestCommit("commit_confirmed",pending.ticket,pending.unityId,activePlatform));
             BridgeNetwork.ImportResult result = onClientAsync(() -> BridgeNetwork.requestRemoval(pending.ticket, pending.unityId, activePlatform));
             unsafeResult = false;
             store.journal(pending.recordKey, record, result.success() ? "COMMITTED_AND_REMOVED" : "COMMITTED_SOURCE_RETAINED");
-            if (!result.success()) throw new IOException(result.message());
-            say(result.message());
+            if (!result.success()) throw new IOException("远端已提交 / 本地移除失败："+result.message());
+            removal=null;
+            if(activePlatform==null&&pending.station!=null) {
+                try {onClientAsync(()->BridgeNetwork.requestPlatform("acknowledge",pending.station));}
+                catch(Exception e){LOGGER.warn("移除成功，传输台警告未清除",e);}
+            }
+            status="女仆已传送，MC 原实体已移除";say(status);
         });
     }
 
     public void exportMaid(boolean migrate) {
-        run(migrate ? "上传女仆并准备迁移确认" : "上传女仆副本", () -> {
+        run("发送女仆", () -> {
+            unsafeResult=false;
+            if(!connected())connect(endpointHost(),endpointPort());
             requireTransferIdle();
             UUID maidId = jobPlatform.get() == null ? selected : UUID.fromString(jobPlatform.get().get("maid").getAsString());
+            if(removal!=null&&removal.maid.equals(maidId))throw new IOException("远端已提交 / 本地移除待处理，请使用 confirm_remove，不要再次上传");
             if (maidId == null) throw new IOException("请先 /maidhome maids 选择女仆");
-            BridgeNetwork.ExportResult data = onClientAsync(() -> BridgeNetwork.requestExport(maidId, activePlatform));
+            BridgeNetwork.ExportResult data = onClientAsync(() -> BridgeNetwork.requestMaidExport(maidId, activePlatform));
             if (!data.scopeId().equals(scope)) throw new IOException("世界／玩家身份已变化，请重新连接 Unity");
             var snapshot = onClient(() -> {
                 var level = Minecraft.getInstance().level;
@@ -262,33 +270,35 @@ public final class BridgeClientService {
                 if (!maid.getModelId().equals(data.modelId())) throw new IllegalStateException("模型刚发生变化，请重新上传");
                 return MaidResourceExporter.capture(maid, data);
             });
-            snapshot.warnings().forEach(this::say);
+            snapshot.warnings().forEach(LOGGER::warn);
+            say("女仆档案与模型准备完成");
             checkCancelled();
             Path folder = store.createPackage("maid");
             MaidResourceExporter.export(snapshot, data.archive(), folder);
             onClient(() -> { MaidResourceExporter.validate(snapshot); return null; });
             checkCancelled(); requireTransferIdle();
-            if (jobPlatform.get() != null) {
+            {
+                say("检查女仆音效包");
                 var sounds = queryList("sound");
                 boolean exists = false;
                 for (var item : sounds) if (item.isJsonObject() && data.soundId().equals(BridgeNetwork.str(item.getAsJsonObject(), "id"))) exists = true;
-                if (exists) say("所需音效 ID 已存在；未校验内容是否一致或最新。可在音效页手动重新上传。");
+                if (exists) say("音效包已存在，跳过上传（未比较内容版本）");
                 else { progress("先发送所需音效包：" + data.soundId()); uploadSoundPackage(data.soundId()); }
                 checkCancelled();
             }
             JsonObject identity = new JsonObject(); identity.addProperty("source_maid_uuid", data.maidUuid().toString());
             identity.addProperty("archive_sha256", SafeFiles.sha256(data.archive())); identity.addProperty("scope", scope);
-            identity.addProperty("migration_requested", migrate);
-            uploading = uploader();
+            identity.addProperty("migration_requested", true);
+            uploading = uploader().beforeCommit(() -> {
+                checkCancelled();
+                try { validatePlatform();onClientAsync(() -> BridgeNetwork.requestCommit("commit_intent",data.removalTicket(),"",activePlatform)); unsafeResult=true; }
+                catch(Exception e){throw new CompletionException(e);}
+            });
             PackageUploader.Result result = uploading.upload("maid", null, data.name(), folder, identity, this::progress);
-            status = "女仆已提交：" + result.id();
-            say("已上传 " + data.name() + "，Unity ID：" + result.id() + "。MC 原女仆保留。");
-            say("档案遵循 MaidFileManager：背包和主副手物品不会完整搬运；音效可用 /maidhome sound 单独上传。");
-            if (migrate) {
-                removal = new PendingRemoval(data.removalTicket(), result.id(), result.recordKey(), data.name(), scope, data.maidUuid());
-                say("已收到 Unity 提交成功回执。确认移除前，请确保女仆全部物品栏与背包已清空；服务端会再次核对。");
-                clickable("[确认移除 MC 原女仆：" + data.name() + "]", "/maidhome confirm_remove");
-            }
+            removal = new PendingRemoval(data.removalTicket(),result.id(),result.recordKey(),data.name(),scope,data.maidUuid(),jobPlatform.get()==null?null:jobPlatform.get().deepCopy());
+            unsafeResult=true;
+            try {confirmRemoval();}
+            catch(Exception e){unsafeResult=true;status="远端已提交 / 本地移除失败，请核对两端，禁止重复上传";say(status);throw e;}
         });
     }
 
@@ -311,7 +321,7 @@ public final class BridgeClientService {
             checkCancelled(); requireTransferIdle();
             uploading = uploader();
             PackageUploader.Result result = uploading.upload("sound", soundId, soundId, folder, new JsonObject(), this::progress);
-            status = "音效已提交：" + result.id(); say(status);
+            LOGGER.info("音效已提交：{}",result.id());status = "音效已提交"; say(status);
     }
 
     public void uploadHouse(String name) {
@@ -326,7 +336,7 @@ public final class BridgeClientService {
             checkCancelled(); requireTransferIdle();
             uploading = uploader();
             PackageUploader.Result result = uploading.upload("house", null, name, exported, new JsonObject(), this::progress);
-            status = "房屋已提交：" + result.id(); say(status);
+            LOGGER.info("房屋已提交：{}",result.id());status = "房屋已提交"; say(status);
         });
     }
 
@@ -350,6 +360,13 @@ public final class BridgeClientService {
         if (data == null || data.getData() == null) throw new IOException("不是有效的 MaidFileManager 女仆档案");
     }
     private void progress(String text) {
+        LOGGER.debug("{}",text);
+        var uploadProgress=java.util.regex.Pattern.compile("上传 (maid|sound|house) (\\d+)/(\\d+) 字节.*").matcher(text);
+        if(uploadProgress.matches()) {
+            String kind=switch(uploadProgress.group(1)){case "maid"->"女仆";case "sound"->"音效";default->"房屋";};
+            long total=Long.parseLong(uploadProgress.group(3)),sent=Long.parseLong(uploadProgress.group(2));
+            text="正在发送"+kind+"："+(total==0?100:sent*100/total)+"%";
+        }
         status = text;
         long now = System.nanoTime();
         if (now - lastProgress >= TimeUnit.SECONDS.toNanos(1)) { lastProgress = now; say(text); }
@@ -370,7 +387,7 @@ public final class BridgeClientService {
             catch (Exception e) {
                 Throwable cause = e; while (cause.getCause() != null) cause = cause.getCause();
                 status = cause instanceof CancellationException ? "任务已取消；已完成步骤与备份保留" : description + "失败：" + (cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage());
-                say(status);
+                LOGGER.error("{}",description,e);say(status);
             } finally { jobGeneration.remove(); uploading = null; busy.set(false); }
         });
     }
@@ -389,19 +406,13 @@ public final class BridgeClientService {
         return onClient(task).get(65, TimeUnit.SECONDS);
     }
     public void say(String message) {
-        history.addLast(java.time.LocalTime.now().withNano(0) + " " + message);
-        while (history.size() > 500) history.pollFirst();
-        String display = message.length() > 2048 ? message.substring(0, 2048) + "…（内容已截断）" : message;
-        Minecraft.getInstance().execute(() -> {
-            if (Minecraft.getInstance().player != null) Minecraft.getInstance().player.sendSystemMessage(Component.literal("[MaidHome] " + display));
-        });
+        LOGGER.info("{}",message);
+        String display=message.replace('\n',' ').replace('\r',' ');
+        if(display.length()>220)display=display.substring(0,220)+"…";
+        history.addLast(java.time.LocalTime.now().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))+" "+display);
+        while(history.size()>40)history.pollFirst();
     }
-    private void clickable(String label, String command) {
-        Minecraft.getInstance().execute(() -> {
-            if (Minecraft.getInstance().player != null) Minecraft.getInstance().player.sendSystemMessage(Component.literal(label)
-                    .withStyle(s -> s.withColor(ChatFormatting.AQUA).withClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND, command))));
-        });
-    }
+    private void clickable(String label,String command) {say(label+"；指令："+command);}
 
     public boolean busy() { return busy.get(); }
     public java.util.List<BridgeNetwork.MaidSummary> ownMaids() { return ownMaids; }
@@ -411,8 +422,23 @@ public final class BridgeClientService {
         platformTask(station,"maid_move",maid,this::confirmRemoval);
     }
     public boolean connected() { return portal != null && portal.connected(); }
-    public String endpointHost() { return endpointHost; }
-    public int endpointPort() { return endpointPort; }
+    private Path endpointFile(){return net.neoforged.fml.loading.FMLPaths.CONFIGDIR.get().resolve("maidhome_bridge-client.properties");}
+    private synchronized void loadEndpoint() {
+        if(endpointLoaded)return;endpointLoaded=true;
+        try{var saved=EndpointSettings.load(endpointFile());endpointHost=saved.host();endpointPort=saved.port();}
+        catch(IOException e){LOGGER.warn("无法读取连接设置，使用本机默认地址",e);}
+    }
+    public synchronized void configureEndpoint(String host,int port)throws IOException {
+        var settings=new EndpointSettings(host,port);settings.save(endpointFile());
+        endpointHost=settings.host();endpointPort=settings.port();endpointLoaded=true;
+    }
+    public void reconnect(String host,int port) {
+        if(busy()||incoming!=null&&incoming.active()){say("任务仍在进行，请先断开并等待任务结束，再重连");return;}
+        try{configureEndpoint(host,port);}catch(Exception e){say(e.getMessage());return;}
+        disconnect();connect(endpointHost(),endpointPort());
+    }
+    public String endpointHost() {loadEndpoint();return endpointHost;}
+    public int endpointPort() {loadEndpoint();return endpointPort;}
     public String taskStatus() { return status; }
     public String waitingMode() { return waitMode; }
     public boolean hasReceipt() { return incoming != null && incoming.ready() != null; }
@@ -519,10 +545,7 @@ public final class BridgeClientService {
         });
     }
     public void sendFromPlatform(JsonObject station,UUID maid,boolean migrate) {
-        platformTask(station,migrate?"maid_move":"maid_copy",maid,() -> {
-            exportMaid(migrate);
-            if(migrate) { checkCancelled(); validatePlatform(); confirmRemoval(); }
-        });
+        platformTask(station,"maid_move",maid,() -> exportMaid(true));
     }
     public void soundFromPlatform(JsonObject station,String soundId) {
         platformTask(station,"sound",null,() -> { requireTransferIdle(); uploadSoundPackage(soundId); });
@@ -531,21 +554,53 @@ public final class BridgeClientService {
     public void houseFromPlatform(JsonObject station,String name) {
         platformTask(station,"house",null,() -> uploadHouse(name));
     }
-    public void waitFromPlatform(JsonObject station,String mode,boolean wait) {
-        platformTask(station,mode.equals("reject")?"receive_manual":"receive_"+mode,null,() -> {
-            waitMode=mode; rejectIncoming=false;
-            long deadline=System.nanoTime()+TimeUnit.MINUTES.toNanos(5);
-            if(wait) {
-                status="等待接收：请在 MaidHome 将女仆放入背包，再点击发送（5 分钟）";
-                say(status);
-                while(!hasReceipt()) {
-                    checkCancelled(); requirePortal();
-                    if(System.nanoTime()>deadline) throw new CancellationException("接收等待已超时");
-                    Thread.sleep(100);
-                }
-            }
-            checkCancelled(); validatePlatform(); receive(mode);
-            status=mode.equals("import")?"已导入台面并发送 ACK；请核对 MaidHome 接收结果":mode.equals("save")?"档案已保存并发送 ACK；请核对 MaidHome 接收结果":"已拒收，MaidHome 档案保留";
+    public void enableReceiver(JsonObject station,long revision,boolean replace,java.util.function.Consumer<JsonObject> response) {
+        run("启用接收端",()->{
+            if(!connected())connect(endpointHost,endpointPort);
+            JsonObject j=station.deepCopy();j.addProperty("revision",revision);j.addProperty("replace",replace);
+            JsonObject result=onClientAsync(()->BridgeNetwork.requestPlatform("receiver_enable",j));
+            onClient(()->{response.accept(result);return null;});
+            if(!result.has("replace_required")){status="接收端已启用，等待 MaidHome 发送";say(status);}
+        });
+    }
+    public void disableReceiver(JsonObject station) {
+        run("停用接收端",()->{onClientAsync(()->BridgeNetwork.requestPlatform("receiver_disable",station));status="接收端已停用";say(status);});
+    }
+    private CompletableFuture<JsonObject> beginReceiver(long token) {
+        CompletableFuture<JsonObject> result=new CompletableFuture<>();
+        Minecraft.getInstance().execute(()->{
+            if(generation.get()!=token){result.completeExceptionally(new IOException("世界已变化"));return;}
+            BridgeNetwork.requestPlatform("receiver_begin",new JsonObject()).whenComplete((context,error)->{
+                if(error!=null)result.completeExceptionally(error);
+                else if(generation.get()!=token)result.completeExceptionally(new IOException("世界已变化"));
+                else {activePlatform=context;platformBroken=false;remoteRisk=false;result.complete(context);}
+            });
+        });return result;
+    }
+    private void finishReceiver(CompletableFuture<JsonObject> binding,String outcome,String detail) {
+        if(binding==null)return;
+        binding.thenAccept(context->Minecraft.getInstance().execute(()->{
+            JsonObject end=context.deepCopy();end.addProperty("outcome",outcome);end.addProperty("detail",detail==null?"接收失败":detail);
+            BridgeNetwork.requestPlatform("finish",end);if(activePlatform==context)activePlatform=null;
+        }));
+    }
+    private void processArrival(PortalClient client,IncomingTransfer receiving,IncomingTransfer.Receipt receipt,CompletableFuture<JsonObject> binding,long token,String mode) {
+        run("接收女仆",()->{
+            String outcome="error",detail="接收失败";unsafeResult=false;ackWriteStarted=false;
+            try {
+                if(generation.get()!=token)throw new IOException("世界已变化");
+                if(!mode.equals("import")){receive(mode);outcome="cancelled";detail="备份已保留，MaidHome 女仆未移除";status=detail;return;}
+                if(binding==null)throw new IOException("没有有效接收端");
+                JsonObject context=binding.get(65,TimeUnit.SECONDS);jobPlatform.set(context);activePlatform=context;
+                checkCancelled();validateArchive(receipt.archive());validatePlatform();receive("import");
+                outcome="success";detail="女仆已恢复到接收台";status=detail;say(detail);
+            } catch(Exception e) {
+                Throwable cause=e;while(cause.getCause()!=null)cause=cause.getCause();detail=String.valueOf(cause.getMessage());
+                if(unsafeResult)outcome="uncertain";
+                if(ackWriteStarted)client.close();
+                else if(receiving.ready()!=null&&client.connected()){client.acknowledge(receipt.id(),false,"接收未完成："+detail);receiving.clear();}
+                throw e;
+            } finally {finishReceiver(binding,outcome,detail);jobPlatform.remove();}
         });
     }
 }

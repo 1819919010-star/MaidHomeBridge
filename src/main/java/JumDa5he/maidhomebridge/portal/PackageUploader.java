@@ -77,6 +77,7 @@ public final class PackageUploader {
             }
             checkCancel();
             commitCheck.run();
+            checkCancel(); // The server-side precommit check may have waited while cancellation arrived.
             store.journal(key, record, "COMMIT_RESULT_UNCERTAIN");
             committing = true;
             commitStarted = true;

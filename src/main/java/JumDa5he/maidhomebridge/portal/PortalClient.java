@@ -47,7 +47,7 @@ public final class PortalClient implements AutoCloseable {
     public JsonObject hello() throws IOException {
         JsonObject hello = message("hello");
         hello.addProperty("version", 1);
-        hello.addProperty("client", "maidhome_bridge/0.2.1 (JumDa5he)");
+        hello.addProperty("client", "maidhome_bridge/0.3.1 (JumDa5he)");
         JsonObject response = request(hello, new byte[0]);
         if (PortalFrame.integer(response, "version", -1, Integer.MAX_VALUE) != 1) {
             close(); throw new IOException("Unity 协议版本不是 1");

@@ -55,6 +55,7 @@ public final class ServerBridge {
                 case "export" -> export(player, request.metadata(), journal);
                 case "import" -> importMaid(player, request, journal);
                 case "remove" -> remove(player, request.metadata(), journal);
+                case "commit_intent", "commit_confirmed" -> commit(player,request.operation(),request.metadata(),journal);
                 default -> CompletableFuture.failedFuture(new IOException("未知桥接操作"));
             };
         } catch (Exception e) { result = CompletableFuture.failedFuture(e); }
@@ -78,20 +79,26 @@ public final class ServerBridge {
     private static CompletableFuture<BridgeNetwork.Message> export(ServerPlayer player, JsonObject request, ServerJournal journal) throws IOException {
         EntityMaid maid = ownMaid(player, UUID.fromString(BridgeNetwork.str(request, "maid")));
         PlatformService.authorizeMaid(player,request,maid);
+        boolean transfer=request.has("transfer")&&request.get("transfer").getAsBoolean();
+        if(transfer)requireEmptyForMigration(maid);
         if (maid.isYsmModel()) throw new IOException("不支持 YSM 女仆模型，请先切换为普通模型");
         MaidFileData data = PlatformService.snapshot(player, maid);
         if (data == null) throw new IOException("MaidFileManager 拒绝导出此女仆");
         UUID ticket = UUID.randomUUID();
+        if(transfer) {
         TICKETS.entrySet().removeIf(e -> System.nanoTime() - e.getValue().created > TICKET_TTL
                 || (e.getValue().player.equals(player.getUUID()) && e.getValue().maid.equals(maid.getUUID())));
         if (TICKETS.size() >= 128 || TICKETS.values().stream().filter(t -> t.player.equals(player.getUUID())).count() >= 16) throw new IOException("待确认导出过多，请稍后重试");
         TICKETS.put(ticket, new Ticket(player.getUUID(), maid.getUUID(), fingerprint(data), System.nanoTime(), maid.level().getGameTime()));
+        }
         JsonObject meta = new JsonObject();
         meta.addProperty("maidUuid", maid.getUUID().toString()); meta.addProperty("modelId", maid.getModelId());
         meta.addProperty("name", maid.hasCustomName() ? maid.getCustomName().getString() : data.getDisplayName());
         meta.addProperty("ownerUuid", player.getUUID().toString()); meta.addProperty("ownerName", player.getGameProfile().getName());
         meta.addProperty("soundId", maid.getSoundPackId()); meta.addProperty("removalTicket", ticket.toString());
         return io(() -> {
+            if(transfer&&!TransferPolicy.mayExport(journal.read(journal.receipt(player.getUUID(),"outgoing",maid.getUUID().toString()))))
+                throw new IOException("这只女仆已有提交或待确认记录，请使用 confirm_remove 处理或核对两端，禁止重复上传");
             byte[] archive = MaidFilePackets.serializeMaidFileData(data);
             if (archive == null || archive.length == 0 || archive.length > BridgeNetwork.MAX_ARCHIVE) throw new IOException(".maid 导出失败或大于 512 KiB");
             meta.addProperty("scopeId", journal.scope(player.getUUID()));
@@ -109,7 +116,7 @@ public final class ServerBridge {
             if (existing != null) {
                 if (!digest.equals(BridgeNetwork.str(existing, "sha256"))) throw new IOException("接收 ID 已存在但文件校验值不同");
                 // A restart may have interrupted world saving. Never claim a prior spawn persisted merely from a disk receipt.
-                if (!"REJECTED".equals(BridgeNetwork.str(existing, "state"))) throw new IOException("此接收记录已经处理或处于待确认状态，请核对世界中的女仆和本地接收文件，禁止盲目再次导入");
+                if (!TransferPolicy.mayReceiveTransaction(existing)) throw new IOException("此接收记录已经处理或处于待确认状态，请核对世界中的女仆和本地接收文件，禁止盲目再次导入");
             }
             MaidFileData data = MaidFilePackets.deserializeMaidFileData(archive);
             if (data == null || data.getData() == null) throw new IOException("MaidFileManager 无法读取归档");
@@ -118,38 +125,65 @@ public final class ServerBridge {
             String sourceKey = source == null ? "legacy-sha256:" + digest : "maid-uuid:" + source;
             Path sourceReceipt = journal.receipt(playerId, "sources", sourceKey);
             JsonObject sourceRecord = journal.read(sourceReceipt);
-            if (sourceRecord != null && !"REJECTED".equals(BridgeNetwork.str(sourceRecord, "state")))
-                throw new IOException("此源女仆已有导入或待确认记录；更改 Unity ID 不能再次生成，请先人工核对");
+            if (!TransferPolicy.mayReceiveSource(sourceRecord))
+                throw new IOException("此女仆仍在 MC 或上次导入结果待确认；合法移出后才能再次接收");
             JsonObject record = new JsonObject(); record.addProperty("state", "PENDING"); record.addProperty("sha256", digest);
-            record.addProperty("sourceMaidUuid", source); record.addProperty("createdAt", System.currentTimeMillis());
+            record.addProperty("sourceKey",sourceKey); record.addProperty("sourceMaidUuid", source); record.addProperty("createdAt", System.currentTimeMillis());
             record.addProperty("receiptKey", BridgeNetwork.str(request.metadata(), "receipt"));
             journal.write(sourceReceipt, record);
             journal.write(receipt, record);
             return new PreparedImport(data, receipt, sourceReceipt, record);
         }).thenCompose(prepared -> onServer(server, () -> {
             requirePlayer(player);
-            var result = request.metadata().has("platform")
-                    ? PlatformService.importAt(player,request.metadata().getAsJsonObject("platform"),prepared.data)
-                    : MaidTransferService.importMaidFromData(player, prepared.data, true);
-            return new Imported(prepared, result.spawned(), result.message().getString());
+            if(!request.metadata().has("platform"))return new Imported(prepared,false,"请先启用接收台",null);
+            var arrival=PlatformService.importAt(player,request.metadata().getAsJsonObject("platform"),prepared.data);
+            return new Imported(prepared,arrival.result().spawned(),arrival.result().message().getString(),arrival.maid()==null?null:arrival.maid().getUUID());
         })).thenCompose(imported -> io(() -> {
             imported.prepared.record.addProperty("state", imported.success ? "SPAWNED" : "REJECTED");
             imported.prepared.record.addProperty("message", imported.message);
+            if(imported.entity!=null){
+                imported.prepared.record.addProperty("entityUuid",imported.entity.toString());
+                journal.write(journal.receipt(playerId,"entity-origins",imported.entity.toString()),imported.prepared.record);
+                JsonObject resident=new JsonObject();resident.addProperty("state","RESIDENT");resident.addProperty("arrivalReceipt",BridgeNetwork.str(imported.prepared.record,"receiptKey"));
+                journal.write(journal.receipt(playerId,"outgoing",imported.entity.toString()),resident);
+            }
             journal.write(imported.prepared.receipt, imported.prepared.record);
             journal.write(imported.prepared.sourceReceipt, imported.prepared.record);
             return outcome(imported.success, imported.message);
         }));
+    }
+    private static CompletableFuture<BridgeNetwork.Message> commit(ServerPlayer player,String operation,JsonObject request,ServerJournal journal) throws IOException {
+        UUID id=UUID.fromString(BridgeNetwork.str(request,"ticket"));Ticket t=TICKETS.get(id);
+        if(t==null||!t.player.equals(player.getUUID())||System.nanoTime()-t.created>TICKET_TTL)throw new IOException("发送凭据已过期");
+        EntityMaid maid=ownMaid(player,t.maid);PlatformService.authorizeMaid(player,request,maid);
+        if(operation.equals("commit_intent"))recheckRemoval(player,t);
+        return io(()->{
+            Path file=journal.receipt(player.getUUID(),"outgoing",t.maid.toString());JsonObject old=journal.read(file);
+            if(operation.equals("commit_intent")) {
+                if(!TransferPolicy.mayExport(old))throw new IOException("此女仆的上次提交结果待处理，禁止重复上传");
+                old=new JsonObject();old.addProperty("ticket",id.toString());old.addProperty("maidUuid",t.maid.toString());old.addProperty("state","COMMIT_INTENT");
+            } else {
+                if(old==null||!id.toString().equals(BridgeNetwork.str(old,"ticket")))throw new IOException("提交回执与发送凭据不一致");
+                String upload=BridgeNetwork.str(request,"uploadId");if(upload.isBlank()||upload.length()>256)throw new IOException("提交 ID 无效");
+                if(old.has("uploadId")&&!upload.equals(BridgeNetwork.str(old,"uploadId")))throw new IOException("提交 ID 已变化");
+                old.addProperty("uploadId",upload);old.addProperty("state","REMOTE_COMMITTED");
+            }
+            journal.write(file,old);return outcome(true,"提交状态已记录");
+        });
     }
     private static CompletableFuture<BridgeNetwork.Message> remove(ServerPlayer player, JsonObject request, ServerJournal journal) throws IOException {
         UUID ticketId = UUID.fromString(BridgeNetwork.str(request, "ticket"));
         String uploadId = BridgeNetwork.str(request, "uploadId");
         if (uploadId.isBlank() || uploadId.length() > 256) throw new IOException("缺少 Unity 提交回执 ID");
         Ticket ticket = TICKETS.get(ticketId);
-        if (ticket == null || !ticket.player.equals(player.getUUID()) || System.nanoTime() - ticket.created > TICKET_TTL) throw new IOException("移除凭据过期或无效；请核对 Unity 中的副本后重新操作");
+        if (ticket == null || !ticket.player.equals(player.getUUID()) || System.nanoTime() - ticket.created > TICKET_TTL) throw new IOException("移除凭据过期或无效；请核对两端与备份，禁止重复上传");
         PlatformService.authorizeMaid(player,request,ownMaid(player,ticket.maid));
         recheckRemoval(player, ticket);
         MinecraftServer server = player.getServer();
         return io(() -> {
+            Path outgoing=journal.receipt(player.getUUID(),"outgoing",ticket.maid.toString());
+            JsonObject committed=journal.read(outgoing);
+            if(committed==null||!"REMOTE_COMMITTED".equals(BridgeNetwork.str(committed,"state"))||!uploadId.equals(BridgeNetwork.str(committed,"uploadId"))||!ticketId.toString().equals(BridgeNetwork.str(committed,"ticket")))throw new IOException("未确认当前任务远端提交，禁止移除");
             Path receipt = journal.receipt(player.getUUID(), "removals", ticketId.toString());
             if (journal.read(receipt) != null) throw new IOException("此移除已提交，需人工核对，不能盲目重试");
             JsonObject record = new JsonObject(); record.addProperty("state", "PENDING"); record.addProperty("maidUuid", ticket.maid.toString()); record.addProperty("uploadId", uploadId);
@@ -158,13 +192,20 @@ public final class ServerBridge {
             requirePlayer(player);
             EntityMaid maid = recheckRemoval(player, ticket);
             PlatformService.authorizeMaid(player,request,maid);
+            unregisterMaidWorldData(maid);
             TICKETS.remove(ticketId);
-            MaidTransferService.unregisterMaidWorldData(maid);
             PlatformService.removed(maid);
             maid.discard();
+            PlatformService.playTransferSound(maid);
             return record;
         })).thenCompose(record -> io(() -> {
             record.record.addProperty("state", "REMOVED"); journal.write(record.path, record.record);
+            journal.write(journal.receipt(player.getUUID(),"outgoing",ticket.maid.toString()),record.record);
+            JsonObject origin=journal.read(journal.receipt(player.getUUID(),"entity-origins",ticket.maid.toString()));
+            if(origin!=null){
+                Path source=journal.receipt(player.getUUID(),"sources",BridgeNetwork.str(origin,"sourceKey"));JsonObject residency=journal.read(source);
+                if(residency!=null&&ticket.maid.toString().equals(BridgeNetwork.str(residency,"entityUuid"))){residency.addProperty("state","OUTBOUND");residency.addProperty("outgoingUnityId",uploadId);journal.write(source,residency);}
+            }
             return outcome(true, "已复核权限、背包和导出状态，移除 MC 原女仆");
         }));
     }
@@ -172,16 +213,28 @@ public final class ServerBridge {
         EntityMaid maid = ownMaid(player, ticket.maid);
         requireEmptyForMigration(maid);
         MaidFileData current = PlatformService.snapshot(player, maid);
-        if (current == null || !SnapshotGuard.matches(ticket.snapshot, fingerprint(current), Math.max(0, maid.level().getGameTime() - ticket.gameTime))) throw new IOException("女仆状态自导出后发生变化，已保留原实体。请重新上传并确认");
+        long elapsed=Math.max(0, maid.level().getGameTime()-ticket.gameTime);
+        CompoundTag now=current==null?null:fingerprint(current);
+        if(now==null || !SnapshotGuard.matches(ticket.snapshot,now,elapsed)) {
+            String paths=now==null?"无法读取当前档案":SnapshotGuard.differences(ticket.snapshot,now,elapsed);
+            org.slf4j.LoggerFactory.getLogger("MaidHomeBridge").warn("女仆 {} 传输复核失败；变化字段：{}",maid.getUUID(),paths);
+            throw new IOException("女仆状态自导出后发生变化（"+paths+"），已保留原实体；若远端已提交，请核对两端后恢复，禁止重复上传");
+        }
         return maid;
     }
     public static void requireEmptyForMigration(EntityMaid maid) throws IOException {
         if (!empty(maid.getMaidInv()) || !empty(maid.getHideInv()) || !empty(maid.getTaskInv()) || !empty(maid.getMaidBauble())
                 || !empty(maid.getHandsInvWrapper()) || !empty(maid.getArmorInvWrapper()) || !empty(maid.getAvailableBackpackInv())) {
-            throw new IOException("移除已阻止：请先取回女仆背包、隐藏栏、任务栏、饰品、护甲和主副手的全部物品，再重新上传");
+            throw new IOException("请先取回女仆背包、隐藏栏、任务栏、饰品、护甲和主副手的全部物品；若远端已提交，请使用 confirm_remove 复核");
         }
         CompoundTag raw = maid.saveWithoutId(new CompoundTag());
         if (raw.contains("MaidBackpackData") && !raw.getCompound("MaidBackpackData").isEmpty()) throw new IOException("移除已阻止：女仆仍有背包扩展数据，请卸下背包后重新上传");
+    }
+    /** TLM owns this registry; the equivalent MFM convenience method only exists in 1.4.3. */
+    public static void unregisterMaidWorldData(EntityMaid maid) {
+        if(maid.getOwnerUUID()==null)return;
+        var worldData=com.github.tartaricacid.touhoulittlemaid.world.data.MaidWorldData.get(maid.level());
+        if(worldData!=null)worldData.removeInfo(maid);
     }
     private static EntityMaid ownMaid(ServerPlayer player, UUID id) throws IOException {
         requirePlayer(player);
@@ -218,6 +271,6 @@ public final class ServerBridge {
     }
     private record Ticket(UUID player, UUID maid, CompoundTag snapshot, long created, long gameTime) {}
     private record PreparedImport(MaidFileData data, Path receipt, Path sourceReceipt, JsonObject record) {}
-    private record Imported(PreparedImport prepared, boolean success, String message) {}
+    private record Imported(PreparedImport prepared, boolean success, String message,UUID entity) {}
     private record RemovalRecord(Path path, JsonObject record) {}
 }

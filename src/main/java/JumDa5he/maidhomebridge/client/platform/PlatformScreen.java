@@ -1,231 +1,129 @@
 package JumDa5he.maidhomebridge.client.platform;
 
-import JumDa5he.maidhomebridge.client.BridgeClientEvents;
 import JumDa5he.maidhomebridge.client.BridgeClientService;
 import JumDa5he.maidhomebridge.network.BridgeNetwork;
 import JumDa5he.maidhomebridge.platform.PlatformMenu;
 import com.google.gson.JsonObject;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.*;
-import net.minecraft.client.gui.screens.ConfirmScreen;
+import net.minecraft.client.gui.screens.*;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.player.Inventory;
 import net.neoforged.fml.ModList;
 import java.util.*;
-import java.util.function.*;
 
+/** Two primary actions. Service logs and tasks survive closing the screen. */
 public final class PlatformScreen extends AbstractContainerScreen<PlatformMenu> {
     private static final BridgeClientService SERVICE=BridgeClientService.INSTANCE;
     private final JsonObject station=new JsonObject();
     private JsonObject state=new JsonObject();
-    private final List<Control> controls=new ArrayList<>();
-    private final List<Label> labels=new ArrayList<>();
-    private int page, scroll, contentHeight, ticks, soundIndex, maidIndex;
-    private boolean polling, migrate, importMode=true, includePlayers;
-    private String host=SERVICE.endpointHost(), port=Integer.toString(SERVICE.endpointPort());
-    private String first="",second="",houseName="MaidHome",listKind="maid",notice="";
-    private String recordView="remote";
-    private record Control(AbstractWidget widget,int y,BooleanSupplier enabled) {}
-    private record Label(int y,Supplier<Component> text,int color) {}
+    private Button send,receiver,reconnect,disconnect;
+    private EditBox host,port;
+    private int ticks,scroll;
+    private boolean polling;
+    private String lastMaid="";
     public PlatformScreen(PlatformMenu menu,Inventory inv,Component title) {
-        super(menu,inv,title);
-        station.addProperty("x",menu.pos.getX()); station.addProperty("y",menu.pos.getY()); station.addProperty("z",menu.pos.getZ());
-        station.addProperty("station",menu.station.toString());
+        super(menu,inv,title);station.addProperty("x",menu.pos.getX());station.addProperty("y",menu.pos.getY());station.addProperty("z",menu.pos.getZ());station.addProperty("station",menu.station.toString());
     }
-    private static Component tr(String key,Object... args) { return Component.translatable("gui.maidhome_bridge."+key,args); }
+    private static Component tr(String key,Object... args){return Component.translatable("gui.maidhome_bridge.simple."+key,args);}
     @Override protected void init() {
-        imageWidth=Math.min(600,width-12); imageHeight=Math.min(410,height-12);
-        super.init();
-        if(minecraft.level!=null)station.addProperty("dimension",minecraft.level.dimension().location().toString());
-        layout(); refresh();
+        imageWidth=Math.min(440,width-12);imageHeight=Math.min(330,height-12);super.init();
+        station.addProperty("dimension",minecraft.level.dimension().location().toString());
+        send=addRenderableWidget(Button.builder(tr("send"),b->chooseSend()).bounds(leftPos+16,topPos+56,(imageWidth-38)/2,24).build());
+        receiver=addRenderableWidget(Button.builder(tr("enable"),b->toggleReceiver()).bounds(leftPos+22+(imageWidth-38)/2,topPos+56,(imageWidth-38)/2,24).build());
+        String savedHost=host==null?SERVICE.endpointHost():host.getValue(),savedPort=port==null?Integer.toString(SERVICE.endpointPort()):port.getValue();
+        host=addRenderableWidget(new EditBox(font,leftPos+16,topPos+100,imageWidth-102,20,tr("host")));host.setMaxLength(253);host.setValue(savedHost);
+        host.setTooltip(Tooltip.create(tr("host_help")));
+        port=addRenderableWidget(new EditBox(font,leftPos+imageWidth-78,topPos+100,62,20,tr("port")));port.setMaxLength(5);port.setFilter(v->v.matches("[0-9]*"));port.setValue(savedPort);
+        disconnect=addRenderableWidget(Button.builder(tr("disconnect"),b->SERVICE.disconnect()).bounds(leftPos+16,topPos+126,(imageWidth-38)/2,20).build());
+        reconnect=addRenderableWidget(Button.builder(tr("reconnect"),b->{var address=address();if(address!=null)SERVICE.reconnect(address.host(),address.port());}).bounds(leftPos+22+(imageWidth-38)/2,topPos+126,(imageWidth-38)/2,20).build());refresh();
     }
-    private int w() { return imageWidth-24; }
-    private void layout() {
-        clearWidgets(); controls.clear(); labels.clear();
-        int tabW=(imageWidth-24)/5;
-        String[] names={"maid","house","sound","resources","connection"};
-        for(int i=0;i<5;i++) { final int tab=i; Button b=Button.builder(tr(names[i]),v->{page=tab;scroll=0;layout();}).bounds(leftPos+12+i*tabW,topPos+49,tabW-3,20).build(); b.active=i!=page; addRenderableWidget(b); }
-        addRenderableWidget(Button.builder(tr("help"),b->BridgeClientEvents.help()).bounds(leftPos+12,topPos+imageHeight-28,64,20).build());
-        addRenderableWidget(Button.builder(tr("cancel"),b->{ if(ModList.get().isLoaded("minetomesh")) JumDa5he.maidhomebridge.client.house.HouseExporter.cancel(); SERVICE.cancel(); }).bounds(leftPos+80,topPos+imageHeight-28,110,20).build());
-        addRenderableWidget(Button.builder(tr("close"),b->onClose()).bounds(leftPos+imageWidth-76,topPos+imageHeight-28,64,20).build());
-        contentHeight=300;
-        switch(page) { case 0->maids(); case 1->house(); case 2->sounds(); case 3->resources(); default->connection(); }
-        positionControls();
+    private JumDa5he.maidhomebridge.client.EndpointSettings address() {
+        try{return new JumDa5he.maidhomebridge.client.EndpointSettings(host.getValue(),Integer.parseInt(port.getValue()));}
+        catch(NumberFormatException e){SERVICE.say("请填写有效端口，通常为 7411");return null;}
+        catch(IllegalArgumentException e){SERVICE.say(e.getMessage());return null;}
     }
-    private boolean idle() { return !SERVICE.busy() && !flag("active") && !flag("uncertain"); }
-    private boolean eligible() { return state.has("maid") && flag("eligible") && idle(); }
-    private boolean flag(String key) { return state.has(key)&&state.get(key).getAsBoolean(); }
-    private String value(String key) { return BridgeNetwork.str(state,key); }
-    private UUID target() { return UUID.fromString(value("maid")); }
-    private void maids() {
-        label(0,()->tr("target",value("name")),0xD7F7F6);
-        label(14,()->tr("owner",value("owner")),0xB3CBD6);
-        label(28,()->tr("model",value("model")),0xB3CBD6);
-        label(43,()->{
-            int count=state.has("count")?state.get("count").getAsInt():0;
-            if(flag("uncertain"))return tr("uncertain");
-            if(flag("active"))return SERVICE.ownsTask(station)?tr("own_task"):tr("occupied");
-            if(count==0)return tr("no_maid"); if(count>1)return tr("many_maids");
-            return flag("eligible")?tr("ready"):Component.literal(value("reason"));
-        },0xF2CC86);
-        button(0,62,145,migrate?"mode_move":"mode_copy",()->{migrate=!migrate;layout();},()->!SERVICE.busy());
-        button(152,62,w()-152,"send_maid",()->{
-            UUID maid=target(); confirm(migrate?"confirm_move":"confirm_copy",()->SERVICE.sendFromPlatform(station,maid,migrate));
-        },this::eligible);
-        label(87,()->tr(migrate?"move_hint":"copy_hint"),0xB3CBD6);
-        label(106,()->tr("receive_title"),0xD7F7F6);
-        button(0,125,145,importMode?"receive_import":"receive_save",()->{importMode=!importMode;layout();},()->!SERVICE.busy());
-        button(152,125,w()-152,"wait",()->confirm(importMode?"confirm_receive_import":"confirm_receive_save",()->SERVICE.waitFromPlatform(station,importMode?"import":"save",true)),this::idle);
-        button(0,151,145,"stop_wait",SERVICE::cancel,()->SERVICE.ownsTask(station)&&!SERVICE.waitingMode().isEmpty());
-        button(152,151,w()-152,"process_received",()->confirm(importMode?"confirm_receive_import":"confirm_receive_save",()->SERVICE.waitFromPlatform(station,importMode?"import":"save",false)),()->idle()&&SERVICE.hasReceipt());
-        button(0,177,145,"reject",()->SERVICE.waitFromPlatform(station,"reject",false),()->idle()&&SERVICE.hasReceipt());
-        button(152,177,w()-152,"acknowledge",()->confirm("confirm_acknowledge",()->request("acknowledge",new JsonObject(),r->state=r)),()->flag("uncertain")&&!flag("active"));
-        label(202,()->tr("receive_hint"),0xF2CC86);
-        label(216,()->tr("archive_only"),0xB3CBD6);
-        label(241,()->tr("advanced"),0xD7F7F6);
-        button(0,260,145,"original_maids",SERVICE::maids,()->!SERVICE.busy());
-        button(152,260,w()-152,"select_original",()->{
-            var list=SERVICE.ownMaids(); if(!list.isEmpty()){ var maid=list.get(maidIndex++%list.size());SERVICE.select(maid.uuid()); notice=maid.name()+" / "+maid.modelId(); }
-        },()->!SERVICE.busy()&&!SERVICE.ownMaids().isEmpty());
-        label(286,()->tr("selection_hint"),0xB3CBD6);
-        button(0,304,w(),"confirm_remove",()->{
-            UUID maid=target();confirm("confirm_move",()->SERVICE.confirmRemovalFromPlatform(station,maid));
-        },()->eligible()&&SERVICE.removalMatches(target()));
-        label(330,()->Component.literal(notice),0xD7F7F6);
-        contentHeight=360;
+    private boolean applyAddress() {
+        var address=address();if(address==null)return false;
+        if(SERVICE.connected()&&(!address.host().equals(SERVICE.endpointHost())||address.port()!=SERVICE.endpointPort())){SERVICE.say("地址已修改，请先点击重连，再发送或启用接收端");return false;}
+        try{SERVICE.configureEndpoint(address.host(),address.port());return true;}catch(java.io.IOException e){SERVICE.say("连接地址保存失败："+e.getMessage());return false;}
     }
-    private void house() {
-        boolean installed=ModList.get().isLoaded("minetomesh");
-        label(0,()->tr(installed?"wand_hint":"missing_minetomesh"),0xF2CC86);
-        label(16,()->flag("houseAllowed")?tr("house_allowed"):tr("house_denied"),0xB3CBD6);
-        label(40,()->tr("house_name"),0xD7F7F6); edit(0,55,w(),houseName,v->houseName=v,64);
-        label(82,()->tr("first_corner"),0xD7F7F6); edit(0,97,w(),first,v->first=v,48);
-        label(124,()->tr("second_corner"),0xD7F7F6); edit(0,139,w(),second,v->second=v,48);
-        label(165,()->tr("size",selectionSize()),0xB3CBD6);
-        button(0,185,145,includePlayers?"players_yes":"players_no",()->{includePlayers=!includePlayers;layout();},()->installed&&idle());
-        button(152,185,w()-152,"read_selection",()->request("selection",new JsonObject(),this::applySelection),()->installed&&!SERVICE.busy());
-        button(0,211,145,"save_selection",()->{
-            JsonObject data=new JsonObject();data.addProperty("first",first);data.addProperty("second",second);data.addProperty("includePlayers",includePlayers);
-            request("selection",data,this::applySelection);
-        },()->installed&&idle()&&flag("houseAllowed"));
-        button(152,211,w()-152,"send_house",()->SERVICE.houseFromPlatform(station,houseName),()->installed&&idle()&&flag("houseAllowed")&&!houseName.isBlank());
-        label(239,()->tr("house_hint"),0xB3CBD6);label(258,()->Component.literal(notice),0xF2CC86);contentHeight=295;
+    @Override public boolean keyPressed(int key,int scan,int modifiers){
+        if((host.isFocused()||port.isFocused())&&key!=256&&super.getFocused()!=null&&super.getFocused().keyPressed(key,scan,modifiers))return true;
+        if((host.isFocused()||port.isFocused())&&key!=256)return false;
+        return super.keyPressed(key,scan,modifiers);
     }
-    private String selectionSize() {
-        try {
-            String[] a=first.trim().split("[ ,，]+"),b=second.trim().split("[ ,，]+");
-            return (Math.abs(Long.parseLong(a[0])-Long.parseLong(b[0]))+1)+" × "+(Math.abs(Long.parseLong(a[1])-Long.parseLong(b[1]))+1)+" × "+(Math.abs(Long.parseLong(a[2])-Long.parseLong(b[2]))+1);
-        }catch(Exception e){return "—";}
+    private boolean flag(String key){return state.has(key)&&state.get(key).getAsBoolean();}
+    private int count(){return state.has("count")?state.get("count").getAsInt():0;}
+    private void chooseSend() {
+        if(!applyAddress())return;
+        if(flag("uncertain")){SERVICE.say("上次任务结果待确认，请核对两端并使用恢复指令处理");return;}
+        boolean wand=ModList.get().isLoaded("minetomesh")&&java.util.stream.Stream.of(minecraft.player.getMainHandItem(),minecraft.player.getOffhandItem())
+                .anyMatch(s->BuiltInRegistries.ITEM.getKey(s.getItem()).toString().equals("minetomesh:export_wand"));
+        if(wand&&count()>0){minecraft.setScreen(new SendChoice());return;}
+        if(wand){openHouse();return;}sendMaid();
     }
-    private void applySelection(JsonObject value) {
-        first=BridgeNetwork.str(value,"first");second=BridgeNetwork.str(value,"second");includePlayers=value.has("includePlayers")&&value.get("includePlayers").getAsBoolean();
-        notice=tr("selection_loaded").getString();layout();
+    private void sendMaid() {
+        if(count()!=1){SERVICE.say(count()==0?"传输台上未检测到女仆":"台上有多名女仆，请只保留一名");return;}
+        if(!flag("eligible")){SERVICE.say(BridgeNetwork.str(state,"reason"));return;}
+        UUID maid=UUID.fromString(BridgeNetwork.str(state,"maid"));confirm("confirm_send",()->SERVICE.sendFromPlatform(station,maid,true));
     }
-    private String selectedSound() { var sounds=SERVICE.sounds(); return sounds.isEmpty()?"":sounds.get(Math.floorMod(soundIndex,sounds.size())); }
-    private void sounds() {
-        label(0,()->tr("local_sound",selectedSound()),0xD7F7F6);
-        button(0,22,145,"next_sound",()->soundIndex++,()->!SERVICE.sounds().isEmpty());
-        button(152,22,w()-152,"refresh_sound",()->SERVICE.list("sound"),()->SERVICE.connected()&&!SERVICE.busy());
-        label(50,()->{
-            for(var item:SERVICE.remoteList("sound")) if(item.isJsonObject()&&selectedSound().equals(BridgeNetwork.str(item.getAsJsonObject(),"id")))return tr("sound_exists");
-            return tr("sound_not_verified");
-        },0xF2CC86);
-        button(0,76,w(),"send_sound",()->{String id=selectedSound();confirm("confirm_sound",()->SERVICE.soundFromPlatform(station,id));},()->idle()&&!selectedSound().isEmpty());
-        label(106,()->tr("sound_independent"),0xB3CBD6);
-        label(126,()->tr("advanced"),0xD7F7F6);
-        button(0,148,w(),"original_sound",()->confirm("confirm_sound",()->SERVICE.originalSoundFromPlatform(station)),this::idle);
-        label(176,()->tr("original_sound_hint"),0xB3CBD6);contentHeight=205;
+    private void toggleReceiver() {
+        if(flag("receiver_here")){SERVICE.disableReceiver(station);return;}
+        if(!applyAddress())return;
+        JsonObject current=state.has("receiver")?state.getAsJsonObject("receiver"):new JsonObject();
+        long revision=current.has("revision")?current.get("revision").getAsLong():0;
+        if(current.has("enabled")&&current.get("enabled").getAsBoolean())confirm("replace",()->enable(revision,true));else enable(revision,false);
     }
-    private void resources() {
-        int part=(w()-8)/3;
-        for(int i=0;i<3;i++){String kind=new String[]{"maid","house","sound"}[i];button(i*(part+4),0,part,kind,()->{listKind=kind;recordView="remote";scroll=0;layout();},()->true);}
-        button(0,28,110,"refresh",()->{recordView="remote";SERVICE.list(listKind);},()->SERVICE.connected()&&!SERVICE.busy());
-        button(116,28,110,"records",()->{recordView="disk";SERVICE.readRecords();},()->true);
-        button(232,28,Math.max(50,w()-232),"details",()->recordView="history",()->true);
-        label(55,()->tr("list_hint"),0xB3CBD6);contentHeight=95;
-    }
-    private void connection() {
-        label(0,()->tr("host"),0xD7F7F6);edit(0,17,w(),host,v->host=v,253);
-        label(47,()->tr("port"),0xD7F7F6);edit(0,64,120,port,v->port=v,5);
-        button(0,94,100,"connect",this::connect,()->!SERVICE.busy()&&!SERVICE.connected());
-        button(106,94,100,"disconnect",SERVICE::disconnect,()->SERVICE.connected());
-        button(212,94,Math.max(65,w()-212),"reconnect",()->{SERVICE.disconnect();connect();},()->!SERVICE.busy());
-        button(0,120,100,"status",SERVICE::status,()->true);
-        label(150,()->tr("endpoint_hint"),0xB3CBD6);
-        label(173,()->Component.literal(notice),0xF2CC86);contentHeight=200;
-    }
-    private void connect() {
-        try { int number=Integer.parseInt(port);if(number<1||number>65535||host.isBlank())throw new IllegalArgumentException();SERVICE.connect(host.trim(),number); }
-        catch(Exception e){notice=tr("invalid_endpoint").getString();}
-    }
-    private void confirm(String key,Runnable action) {
-        minecraft.setScreen(new ConfirmScreen(ok->{minecraft.setScreen(this);if(ok)action.run();},tr("confirmation"),tr(key),tr("confirm_action"),tr("back")));
-    }
-    private void request(String operation,JsonObject data,Consumer<JsonObject> callback) {
-        JsonObject request=station.deepCopy();data.entrySet().forEach(e->request.add(e.getKey(),e.getValue()));
-        BridgeNetwork.requestPlatform(operation,request).whenComplete((r,e)->minecraft.execute(()->{
-            if(e!=null){Throwable cause=e;while(cause.getCause()!=null)cause=cause.getCause();notice=String.valueOf(cause.getMessage());}
-            else callback.accept(r);
+    private void enable(long revision,boolean replace) {SERVICE.enableReceiver(station,revision,replace,r->{if(r.has("replace_required"))confirm("replace",()->enable(r.get("revision").getAsLong(),true));});}
+    private void confirm(String key,Runnable action) {minecraft.setScreen(new ConfirmScreen(ok->{minecraft.setScreen(this);if(ok)action.run();},tr("confirm_title"),tr(key),tr("continue"),tr("back")));}
+    private void openHouse() {
+        if(!ModList.get().isLoaded("minetomesh")){SERVICE.say("发送房屋需要安装 MineToMesh");return;}
+        BridgeNetwork.requestPlatform("selection",station).whenComplete((selection,error)->minecraft.execute(()->{
+            if(error!=null){logError(error);return;}
+            if(!selection.has("complete")||!selection.get("complete").getAsBoolean()){SERVICE.say("请先使用 MineToMesh 导出杖选择房屋的两个角");return;}
+            minecraft.setScreen(new HouseSend(selection));
         }));
     }
     private void refresh() {
         if(polling)return;polling=true;
-        BridgeNetwork.requestPlatform("status",station.deepCopy()).whenComplete((r,e)->minecraft.execute(()->{
-            polling=false;if(e==null)state=r;else{notice=tr("station_invalid").getString();state=new JsonObject();}
+        BridgeNetwork.requestPlatform("status",station).whenComplete((result,error)->minecraft.execute(()->{
+            polling=false;if(error!=null){state=new JsonObject();return;}state=result;
+            String maid=BridgeNetwork.str(state,"maid");if(!maid.equals(lastMaid)){lastMaid=maid;if(!maid.isEmpty())SERVICE.say("检测到女仆："+BridgeNetwork.str(state,"name"));}
         }));
     }
-    private void label(int y,Supplier<Component> text,int color) { labels.add(new Label(y,text,color)); }
-    private void button(int x,int y,int width,String key,Runnable action,BooleanSupplier enabled) {
-        Button b=Button.builder(tr(key),v->action.run()).bounds(leftPos+12+x,topPos+77+y,width,20).build();
-        b.setTooltip(Tooltip.create(tr(key)));addRenderableWidget(b);controls.add(new Control(b,y,enabled));
-    }
-    private void edit(int x,int y,int width,String value,Consumer<String> change,int max) {
-        EditBox box=new EditBox(font,leftPos+12+x,topPos+77+y,width,20,Component.empty());box.setMaxLength(max);box.setValue(value);box.setResponder(change);
-        addRenderableWidget(box);controls.add(new Control(box,y,()->!SERVICE.busy()));
-    }
-    private int viewport() { return imageHeight-114; }
-    private void positionControls() {
-        for(Control c:controls){int y=topPos+77+c.y-scroll;c.widget.setY(y);c.widget.visible=y>=topPos+77&&y+20<=topPos+imageHeight-37;c.widget.active=c.enabled.getAsBoolean();}
-    }
-    @Override protected void containerTick() { super.containerTick();if(++ticks%20==0)refresh();positionControls(); }
-    @Override public boolean isPauseScreen() { return false; }
-    @Override public boolean mouseScrolled(double x,double y,double horizontal,double vertical) {
-        if(y>topPos+72&&y<topPos+imageHeight-34){scroll=Math.max(0,Math.min(Math.max(0,contentHeight-viewport()),scroll-(int)(vertical*22)));positionControls();return true;}
-        return super.mouseScrolled(x,y,horizontal,vertical);
-    }
-    @Override protected void renderLabels(GuiGraphics g,int x,int y) {}
+    private void logError(Throwable e){while(e.getCause()!=null)e=e.getCause();SERVICE.say(String.valueOf(e.getMessage()));}
+    @Override protected void containerTick(){super.containerTick();if(++ticks%20==0)refresh();send.active=!SERVICE.busy()&&!flag("active");receiver.active=!SERVICE.busy()&&!flag("active");reconnect.active=!SERVICE.busy();host.setEditable(!SERVICE.busy());port.setEditable(!SERVICE.busy());receiver.setMessage(tr(flag("receiver_here")?"disable":"enable"));}
+    @Override public boolean isPauseScreen(){return false;}
+    @Override protected void renderLabels(GuiGraphics g,int x,int y){}
     @Override protected void renderBg(GuiGraphics g,float delta,int mx,int my) {
-        g.fill(leftPos,topPos,leftPos+imageWidth,topPos+imageHeight,0xF0111D2B);
-        g.fill(leftPos,topPos,leftPos+imageWidth,topPos+3,0xFF32C9C0);
-        g.drawString(font,title,leftPos+12,topPos+9,0xF0FAFF,false);
-        Component connection=tr(SERVICE.connected()?"connected":"disconnected",SERVICE.endpointHost()+":"+SERVICE.endpointPort());
-        text(g,connection,leftPos+12,topPos+23,0xA9D6D9);
-        text(g,Component.literal(SERVICE.taskStatus()),leftPos+12,topPos+36,0xF2CC86);
-        g.fill(leftPos+8,topPos+73,leftPos+imageWidth-8,topPos+imageHeight-34,0xFF182A3A);
-        g.enableScissor(leftPos+10,topPos+76,leftPos+imageWidth-10,topPos+imageHeight-35);
-        for(Label l:labels)text(g,l.text.get(),leftPos+12,topPos+78+l.y-scroll,l.color);
-        if(page==3) {
-            var lines=new ArrayList<String>();
-            if(recordView.equals("history")){lines.add(value("detail"));lines.addAll(SERVICE.history());}
-            else if(recordView.equals("disk"))lines.addAll(SERVICE.records());
-            else for(var item:SERVICE.remoteList(listKind))lines.add(item.toString());
-            if(lines.isEmpty())lines.add(tr("no_results").getString());
-            int y=80;
-            for(String line:lines)for(var row:font.split(Component.literal(line),w()-8)){g.drawString(font,row,leftPos+12,topPos+78+y-scroll,0xC6D9E6,false);y+=12;}
-            contentHeight=y+20;
-        }
-        g.disableScissor();
-        if(contentHeight>viewport()) {
-            int available=viewport(), thumb=Math.max(12,available*available/contentHeight);
-            int y=topPos+77+scroll*(available-thumb)/Math.max(1,contentHeight-available);
-            g.fill(leftPos+imageWidth-7,y,leftPos+imageWidth-4,y+thumb,0xFF32C9C0);
-        }
+        g.fill(leftPos,topPos,leftPos+imageWidth,topPos+imageHeight,0xF0111D2B);g.fill(leftPos,topPos,leftPos+imageWidth,topPos+3,0xFF32C9C0);
+        g.drawString(font,title,leftPos+16,topPos+10,0xF0FAFF,false);
+        String status=flag("uncertain")?tr("uncertain").getString():SERVICE.busy()?SERVICE.taskStatus():flag("receiver_here")?tr(SERVICE.connected()?"waiting":"receiver_offline").getString():tr(SERVICE.connected()?"connected":"disconnected").getString();
+        g.drawString(font,font.plainSubstrByWidth(status,imageWidth-32),leftPos+16,topPos+25,0xF2CC86,false);
+        g.drawString(font,font.plainSubstrByWidth(tr("hint").getString(),imageWidth-32),leftPos+16,topPos+40,0xA9D6D9,false);
+        g.drawString(font,tr("host"),leftPos+16,topPos+88,0xA9D6D9,false);
+        g.drawString(font,tr("port"),leftPos+imageWidth-78,topPos+88,0xA9D6D9,false);
+        g.drawString(font,tr("log"),leftPos+16,topPos+156,0xD7F7F6,false);
+        int top=topPos+170,bottom=topPos+imageHeight-10,area=Math.max(12,bottom-top);g.fill(leftPos+12,top-3,leftPos+imageWidth-12,bottom,0xFF182A3A);
+        var rows=new ArrayList<net.minecraft.util.FormattedCharSequence>();for(String line:SERVICE.history())rows.addAll(font.split(Component.literal(line),imageWidth-40));
+        int max=Math.max(0,rows.size()*12-area);scroll=Math.min(scroll,max);int offset=max-scroll;
+        g.enableScissor(leftPos+14,top,leftPos+imageWidth-14,bottom);for(int i=0;i<rows.size();i++)g.drawString(font,rows.get(i),leftPos+17,top+i*12-offset,0xC6D9E6,false);g.disableScissor();
     }
-    private void text(GuiGraphics g,Component text,int x,int y,int color) { g.drawString(font,font.plainSubstrByWidth(text.getString(),w()),x,y,color,false); }
-    @Override public void render(GuiGraphics g,int mx,int my,float delta) {
-        super.render(g,mx,my,delta);renderTooltip(g,mx,my);
-        if(mx>=leftPos+12&&mx<leftPos+imageWidth-12&&my>=topPos+77&&my<topPos+imageHeight-35)
-            for(Label l:labels) {int y=topPos+78+l.y-scroll;if(my>=y&&my<y+10&&font.width(l.text.get())>w())g.renderTooltip(font,font.split(l.text.get(),Math.min(360,width-30)),mx,my);}
+    @Override public boolean mouseScrolled(double x,double y,double horizontal,double vertical){if(y>=topPos+167){scroll=Math.max(0,scroll+(int)(vertical*24));return true;}return super.mouseScrolled(x,y,horizontal,vertical);}
+    private final class SendChoice extends Screen {
+        SendChoice(){super(tr("choose"));}
+        @Override protected void init(){int x=width/2-90,y=height/2;addRenderableWidget(Button.builder(tr("maid"),b->{minecraft.setScreen(PlatformScreen.this);sendMaid();}).bounds(x,y-20,180,24).build());addRenderableWidget(Button.builder(tr("house"),b->openHouse()).bounds(x,y+10,180,24).build());}
+        @Override public void render(GuiGraphics g,int x,int y,float delta){super.render(g,x,y,delta);g.drawCenteredString(font,title,width/2,height/2-45,0xFFFFFF);}
+        @Override public void onClose(){minecraft.setScreen(PlatformScreen.this);}
+    }
+    private final class HouseSend extends Screen {
+        private final JsonObject selection;private EditBox name;
+        HouseSend(JsonObject selection){super(tr("house"));this.selection=selection;}
+        @Override protected void init(){int x=width/2-125,y=height/2;name=addRenderableWidget(new EditBox(font,x,y-10,250,20,tr("house_name")));name.setMaxLength(64);name.setValue("MaidHome");addRenderableWidget(Button.builder(tr("send"),b->{String value=name.getValue().trim();if(value.isEmpty())return;minecraft.setScreen(PlatformScreen.this);SERVICE.houseFromPlatform(station,value);}).bounds(x,y+22,122,24).build());addRenderableWidget(Button.builder(tr("back"),b->onClose()).bounds(x+128,y+22,122,24).build());}
+        @Override public void render(GuiGraphics g,int x,int y,float delta){super.render(g,x,y,delta);g.drawCenteredString(font,title,width/2,height/2-65,0xFFFFFF);g.drawCenteredString(font,BridgeNetwork.str(selection,"first")+" → "+BridgeNetwork.str(selection,"second"),width/2,height/2-48,0xA9D6D9);g.drawCenteredString(font,tr("house_name"),width/2,height/2-28,0xFFFFFF);}
+        @Override public void onClose(){minecraft.setScreen(PlatformScreen.this);}
     }
 }

@@ -56,7 +56,7 @@ public final class BridgeClientEvents {
         root.then(Commands.literal("maids").executes(c -> { SERVICE.maids(); return 1; }));
         root.then(Commands.literal("select").executes(c -> {
             if (Minecraft.getInstance().hitResult instanceof EntityHitResult hit) SERVICE.select(hit.getEntity().getUUID());
-            else SERVICE.say("请对准女仆，或使用 /maidhome maids 点击选择。");
+            else SERVICE.say("请对准女仆，或使用 /maidhome maids 查看 UUID 后选择。");
             return 1;
         }).then(Commands.argument("uuid",StringArgumentType.word()).executes(c -> {
             try { SERVICE.select(UUID.fromString(StringArgumentType.getString(c,"uuid"))); }
@@ -74,9 +74,9 @@ public final class BridgeClientEvents {
     }
     public static void help() {
         SERVICE.say("连接：/maidhome connect [主机] [端口]；状态／断开：status / disconnect");
-        SERVICE.say("选女仆：maids 查看并点击，或 select 对准的女仆；list maid|house|sound 查询 Unity");
-        SERVICE.say("上传副本：export；真实迁移：migrate 上传后还需 confirm_remove；音效：sound");
-        SERVICE.say("返回：在 Unity 背包内点发送，再 receive save|import|reject；cancel 取消当前任务");
+        SERVICE.say("选女仆：maids 查看，select UUID 选择，或 select 对准的女仆；list maid|house|sound 查询 Unity");
+        SERVICE.say("发送女仆：export 或 migrate；提交成功后自动移除 MC 原实体；异常恢复：confirm_remove；音效：sound");
+        SERVICE.say("返回：先启用接收台，再从 Unity 发送；receive save|import|reject 保留为高级入口，save 仅备份不确认删除；cancel 取消");
         if (ModList.get().isLoaded("minetomesh")) SERVICE.say("房屋：用 MineToMesh 导出杖完成选区后 /maidhome house 房屋名称");
     }
 }

@@ -13,15 +13,17 @@ public final class PlatformBlockEntity extends BlockEntity {
     public UUID identity = UUID.randomUUID();
     public UUID operator;
     public boolean uncertain;
+    boolean detaching;
     public String detail = "";
     public long errorUntil;
     public PlatformBlockEntity(BlockPos pos, BlockState state) { super(PlatformContent.ENTITY.get(),pos,state); }
     public List<EntityMaid> occupants() {
-        if (level==null) return List.of();
+        if (level==null || detaching) return List.of();
         return level.getEntitiesOfClass(EntityMaid.class,new AABB(worldPosition).inflate(.25,1,.25),
                 m -> m.isAlive() && PlatformGeometry.onPad(m.getBoundingBox(),worldPosition,getBlockState().getValue(TransferPlatformBlock.FACING)));
     }
     public void visual(TransferPlatformBlock.Visual state) {
+        if(detaching)return;
         if (level!=null && !level.isClientSide && level.getBlockState(worldPosition).is(PlatformContent.BLOCK.get())
                 && level.getBlockEntity(worldPosition)==this && getBlockState().getValue(TransferPlatformBlock.STATE)!=state)
             level.setBlock(worldPosition,getBlockState().setValue(TransferPlatformBlock.STATE,state),3);
@@ -31,8 +33,8 @@ public final class PlatformBlockEntity extends BlockEntity {
         if (level.getGameTime()%10!=0) return;
         PlatformService.tick(p);
         if (PlatformService.active(p)) return;
-        p.visual(p.uncertain || level.getGameTime()<p.errorUntil ? TransferPlatformBlock.Visual.ERROR :
-                p.occupants().size()==1 ? TransferPlatformBlock.Visual.READY : TransferPlatformBlock.Visual.IDLE);
+        p.visual(level.getGameTime()<p.errorUntil ? TransferPlatformBlock.Visual.ERROR :
+                p.occupants().size()==1 || PlatformService.isReceiver(p) ? TransferPlatformBlock.Visual.READY : TransferPlatformBlock.Visual.IDLE);
     }
     @Override protected void saveAdditional(CompoundTag tag, HolderLookup.Provider registries) {
         super.saveAdditional(tag,registries); tag.putUUID("Station",identity);
@@ -43,6 +45,6 @@ public final class PlatformBlockEntity extends BlockEntity {
         super.loadAdditional(tag,registries); if(tag.hasUUID("Station"))identity=tag.getUUID("Station");
         operator=tag.hasUUID("Operator")?tag.getUUID("Operator"):null; uncertain=tag.getBoolean("Uncertain"); detail=tag.getString("Detail");
     }
-    @Override public void setRemoved() { PlatformService.invalidate(this); super.setRemoved(); }
-    @Override public void onChunkUnloaded() { PlatformService.invalidate(this); super.onChunkUnloaded(); }
+    @Override public void setRemoved() { detaching=true; PlatformService.invalidate(this); super.setRemoved(); }
+    @Override public void onChunkUnloaded() { detaching=true; PlatformService.invalidate(this); super.onChunkUnloaded(); }
 }

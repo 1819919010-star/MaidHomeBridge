@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "JumDa5he.maidhomebridge.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "MoreAnimationTransferMixin",
+    "CallResponseNpcTransferMixin",
+    "CallResponseHungerTransferMixin",
+    "CallResponseEmotionTransferMixin",
+    "CallResponseExportClockMixin"
+  ]
+}

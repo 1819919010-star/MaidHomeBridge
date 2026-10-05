@@ -72,7 +72,14 @@ public final class BridgeNetwork {
         return requestExport(maid, null);
     }
     public static CompletableFuture<ExportResult> requestExport(UUID maid, JsonObject platform) {
+        return exportRequest(maid,platform,false);
+    }
+    public static CompletableFuture<ExportResult> requestMaidExport(UUID maid,JsonObject platform) {
+        return exportRequest(maid,platform,true);
+    }
+    private static CompletableFuture<ExportResult> exportRequest(UUID maid,JsonObject platform,boolean transfer) {
         JsonObject meta = new JsonObject(); meta.addProperty("maid", maid.toString());
+        meta.addProperty("transfer",transfer);
         if(platform!=null) meta.add("platform",platform.deepCopy());
         return request("export", meta, new byte[0]).thenApply(m -> new ExportResult(m.archive(),
                 uuid(m.metadata(), "maidUuid"), str(m.metadata(), "modelId"), str(m.metadata(), "name"),
@@ -96,6 +103,11 @@ public final class BridgeNetwork {
         JsonObject meta = new JsonObject(); meta.addProperty("ticket", ticket.toString()); meta.addProperty("uploadId", committedUploadId);
         if(platform!=null) meta.add("platform",platform.deepCopy());
         return request("remove", meta, new byte[0]).thenApply(m -> new ImportResult(m.metadata().get("success").getAsBoolean(), str(m.metadata(), "message")));
+    }
+    public static CompletableFuture<JsonObject> requestCommit(String phase,UUID ticket,String uploadId,JsonObject platform) {
+        JsonObject j=new JsonObject();j.addProperty("ticket",ticket.toString());j.addProperty("uploadId",uploadId);
+        if(platform!=null)j.add("platform",platform.deepCopy());
+        return request(phase,j,new byte[0]).thenApply(Message::metadata);
     }
     public static void clearClientState() {
         PENDING.values().forEach(f -> f.completeExceptionally(new IOException("已离开世界；请重新确认传输状态")));
