@@ -387,7 +387,7 @@ public final class BridgeClientService {
             catch (Exception e) {
                 Throwable cause = e; while (cause.getCause() != null) cause = cause.getCause();
                 status = cause instanceof CancellationException ? "任务已取消；已完成步骤与备份保留" : description + "失败：" + (cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage());
-                LOGGER.error("{}",description,e);say(status);
+                LOGGER.debug("{}",description,e);say(status);
             } finally { jobGeneration.remove(); uploading = null; busy.set(false); }
         });
     }

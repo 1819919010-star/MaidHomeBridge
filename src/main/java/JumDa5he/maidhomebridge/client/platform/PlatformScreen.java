@@ -17,9 +17,12 @@ import java.util.*;
 /** Two primary actions. Service logs and tasks survive closing the screen. */
 public final class PlatformScreen extends AbstractContainerScreen<PlatformMenu> {
     private static final BridgeClientService SERVICE=BridgeClientService.INSTANCE;
+    /** The phone-side app this mod talks to; shown as a prominent, clickable notice. */
+    private static final String PHONE_APP_URL="https://github.com/gly091020/MaidHome-Unity";
     private final JsonObject station=new JsonObject();
     private JsonObject state=new JsonObject();
-    private Button send,receiver,reconnect,disconnect;
+    private Button send,receiver,reconnect,disconnect,scan;
+    private final LanScanner scanner=new LanScanner();
     private EditBox host,port;
     private int ticks,scroll;
     private boolean polling;
@@ -29,16 +32,18 @@ public final class PlatformScreen extends AbstractContainerScreen<PlatformMenu> 
     }
     private static Component tr(String key,Object... args){return Component.translatable("gui.maidhome_bridge.simple."+key,args);}
     @Override protected void init() {
-        imageWidth=Math.min(440,width-12);imageHeight=Math.min(330,height-12);super.init();
+        imageWidth=Math.min(440,width-12);imageHeight=Math.min(360,height-12);super.init();
         station.addProperty("dimension",minecraft.level.dimension().location().toString());
-        send=addRenderableWidget(Button.builder(tr("send"),b->chooseSend()).bounds(leftPos+16,topPos+56,(imageWidth-38)/2,24).build());
-        receiver=addRenderableWidget(Button.builder(tr("enable"),b->toggleReceiver()).bounds(leftPos+22+(imageWidth-38)/2,topPos+56,(imageWidth-38)/2,24).build());
+        send=addRenderableWidget(Button.builder(tr("send"),b->chooseSend()).bounds(leftPos+16,topPos+86,(imageWidth-38)/2,24).build());
+        receiver=addRenderableWidget(Button.builder(tr("enable"),b->toggleReceiver()).bounds(leftPos+22+(imageWidth-38)/2,topPos+86,(imageWidth-38)/2,24).build());
         String savedHost=host==null?SERVICE.endpointHost():host.getValue(),savedPort=port==null?Integer.toString(SERVICE.endpointPort()):port.getValue();
-        host=addRenderableWidget(new EditBox(font,leftPos+16,topPos+100,imageWidth-102,20,tr("host")));host.setMaxLength(253);host.setValue(savedHost);
+        host=addRenderableWidget(new EditBox(font,leftPos+16,topPos+130,imageWidth-158,20,tr("host")));host.setMaxLength(253);host.setValue(savedHost);
         host.setTooltip(Tooltip.create(tr("host_help")));
-        port=addRenderableWidget(new EditBox(font,leftPos+imageWidth-78,topPos+100,62,20,tr("port")));port.setMaxLength(5);port.setFilter(v->v.matches("[0-9]*"));port.setValue(savedPort);
-        disconnect=addRenderableWidget(Button.builder(tr("disconnect"),b->SERVICE.disconnect()).bounds(leftPos+16,topPos+126,(imageWidth-38)/2,20).build());
-        reconnect=addRenderableWidget(Button.builder(tr("reconnect"),b->{var address=address();if(address!=null)SERVICE.reconnect(address.host(),address.port());}).bounds(leftPos+22+(imageWidth-38)/2,topPos+126,(imageWidth-38)/2,20).build());refresh();
+        port=addRenderableWidget(new EditBox(font,leftPos+imageWidth-136,topPos+130,62,20,tr("port")));port.setMaxLength(5);port.setFilter(v->v.matches("[0-9]*"));port.setValue(savedPort);
+        scan=addRenderableWidget(Button.builder(tr("scan"),b->startScan()).bounds(leftPos+imageWidth-68,topPos+128,52,20).build());
+        scan.setTooltip(Tooltip.create(tr("scan_help")));
+        disconnect=addRenderableWidget(Button.builder(tr("disconnect"),b->SERVICE.disconnect()).bounds(leftPos+16,topPos+156,(imageWidth-38)/2,20).build());
+        reconnect=addRenderableWidget(Button.builder(tr("reconnect"),b->{var address=address();if(address!=null)SERVICE.reconnect(address.host(),address.port());}).bounds(leftPos+22+(imageWidth-38)/2,topPos+156,(imageWidth-38)/2,20).build());refresh();
     }
     private JumDa5he.maidhomebridge.client.EndpointSettings address() {
         try{return new JumDa5he.maidhomebridge.client.EndpointSettings(host.getValue(),Integer.parseInt(port.getValue()));}
@@ -49,6 +54,28 @@ public final class PlatformScreen extends AbstractContainerScreen<PlatformMenu> 
         var address=address();if(address==null)return false;
         if(SERVICE.connected()&&(!address.host().equals(SERVICE.endpointHost())||address.port()!=SERVICE.endpointPort())){SERVICE.say("地址已修改，请先点击重连，再发送或启用接收端");return false;}
         try{SERVICE.configureEndpoint(address.host(),address.port());return true;}catch(java.io.IOException e){SERVICE.say("连接地址保存失败："+e.getMessage());return false;}
+    }
+    private void startScan() {
+        if(scanner.running()){scanner.cancel();SERVICE.say("已请求取消扫描");return;}
+        int scanPort;
+        try{scanPort=Integer.parseInt(port.getValue());if(scanPort<1||scanPort>65535)scanPort=7411;}
+        catch(NumberFormatException e){scanPort=7411;}
+        int target=scanPort;
+        scanner.start(target,
+                found->minecraft.execute(()->finishScan(found,target)),
+                progress->minecraft.execute(()->SERVICE.say(progress)));
+    }
+    private void finishScan(java.util.List<LanScanner.Found> found,int foundPort) {
+        if(found.isEmpty()){SERVICE.say("未在局域网内找到 MaidHome 服务；请确认手机已启动 Portal 且与本机处于同一 Wi-Fi");return;}
+        var first=found.get(0);
+        for(var item:found){if(!item.host().startsWith("127.")){first=item;break;}}
+        if(minecraft.screen==this){host.setValue(first.host());port.setValue(Integer.toString(foundPort));}
+        StringBuilder list=new StringBuilder();
+        for(var item:found){if(list.length()>0)list.append("、");list.append(item.host());}
+        SERVICE.say("扫描到 "+found.size()+" 个 MaidHome 服务："+list);
+        SERVICE.say("自动连接 "+first.host()+":"+foundPort);
+        try{SERVICE.configureEndpoint(first.host(),foundPort);}catch(java.io.IOException e){SERVICE.say("连接地址保存失败："+e.getMessage());return;}
+        if(SERVICE.connected())SERVICE.reconnect(first.host(),foundPort);else SERVICE.connect(first.host(),foundPort);
     }
     @Override public boolean keyPressed(int key,int scan,int modifiers){
         if((host.isFocused()||port.isFocused())&&key!=256&&super.getFocused()!=null&&super.getFocused().keyPressed(key,scan,modifiers))return true;
@@ -95,7 +122,7 @@ public final class PlatformScreen extends AbstractContainerScreen<PlatformMenu> 
         }));
     }
     private void logError(Throwable e){while(e.getCause()!=null)e=e.getCause();SERVICE.say(String.valueOf(e.getMessage()));}
-    @Override protected void containerTick(){super.containerTick();if(++ticks%20==0)refresh();send.active=!SERVICE.busy()&&!flag("active");receiver.active=!SERVICE.busy()&&!flag("active");reconnect.active=!SERVICE.busy();host.setEditable(!SERVICE.busy());port.setEditable(!SERVICE.busy());receiver.setMessage(tr(flag("receiver_here")?"disable":"enable"));}
+    @Override protected void containerTick(){super.containerTick();if(++ticks%20==0)refresh();send.active=!SERVICE.busy()&&!flag("active");receiver.active=!SERVICE.busy()&&!flag("active");reconnect.active=!SERVICE.busy();host.setEditable(!SERVICE.busy());port.setEditable(!SERVICE.busy());receiver.setMessage(tr(flag("receiver_here")?"disable":"enable"));if(scanner.running()){scan.setMessage(tr("scanning"));scan.active=true;}else{scan.setMessage(tr("scan"));scan.active=!SERVICE.busy();}}
     @Override public boolean isPauseScreen(){return false;}
     @Override protected void renderLabels(GuiGraphics g,int x,int y){}
     @Override protected void renderBg(GuiGraphics g,float delta,int mx,int my) {
@@ -104,15 +131,29 @@ public final class PlatformScreen extends AbstractContainerScreen<PlatformMenu> 
         String status=flag("uncertain")?tr("uncertain").getString():SERVICE.busy()?SERVICE.taskStatus():flag("receiver_here")?tr(SERVICE.connected()?"waiting":"receiver_offline").getString():tr(SERVICE.connected()?"connected":"disconnected").getString();
         g.drawString(font,font.plainSubstrByWidth(status,imageWidth-32),leftPos+16,topPos+25,0xF2CC86,false);
         g.drawString(font,font.plainSubstrByWidth(tr("hint").getString(),imageWidth-32),leftPos+16,topPos+40,0xA9D6D9,false);
-        g.drawString(font,tr("host"),leftPos+16,topPos+88,0xA9D6D9,false);
-        g.drawString(font,tr("port"),leftPos+imageWidth-78,topPos+88,0xA9D6D9,false);
-        g.drawString(font,tr("log"),leftPos+16,topPos+156,0xD7F7F6,false);
-        int top=topPos+170,bottom=topPos+imageHeight-10,area=Math.max(12,bottom-top);g.fill(leftPos+12,top-3,leftPos+imageWidth-12,bottom,0xFF182A3A);
+        boolean hot=overNotice(mx,my);
+        g.fill(leftPos+12,noticeTop(),leftPos+imageWidth-12,noticeBottom(),hot?0xB06E4B12:0x8A3A2A12);
+        g.fill(leftPos+12,noticeTop(),leftPos+15,noticeBottom(),hot?0xFFFFD166:0xFFE8B84B);
+        g.drawString(font,font.plainSubstrByWidth(tr("phone_title").getString(),imageWidth-44),leftPos+22,noticeTop()+6,0xFFFFD166,false);
+        String url=font.plainSubstrByWidth(PHONE_APP_URL,imageWidth-44);
+        g.drawString(font,url,leftPos+22,noticeTop()+20,0xFF9FD8FF,false);
+        g.fill(leftPos+22,noticeTop()+29,leftPos+22+font.width(url),noticeTop()+30,0xFF9FD8FF);
+        g.drawString(font,tr("host"),leftPos+16,topPos+118,0xA9D6D9,false);
+        g.drawString(font,tr("port"),leftPos+imageWidth-136,topPos+118,0xA9D6D9,false);
+        g.drawString(font,tr("log"),leftPos+16,topPos+186,0xD7F7F6,false);
+        int top=topPos+200,bottom=topPos+imageHeight-10,area=Math.max(12,bottom-top);g.fill(leftPos+12,top-3,leftPos+imageWidth-12,bottom,0xFF182A3A);
         var rows=new ArrayList<net.minecraft.util.FormattedCharSequence>();for(String line:SERVICE.history())rows.addAll(font.split(Component.literal(line),imageWidth-40));
         int max=Math.max(0,rows.size()*12-area);scroll=Math.min(scroll,max);int offset=max-scroll;
         g.enableScissor(leftPos+14,top,leftPos+imageWidth-14,bottom);for(int i=0;i<rows.size();i++)g.drawString(font,rows.get(i),leftPos+17,top+i*12-offset,0xC6D9E6,false);g.disableScissor();
     }
-    @Override public boolean mouseScrolled(double x,double y,double horizontal,double vertical){if(y>=topPos+167){scroll=Math.max(0,scroll+(int)(vertical*24));return true;}return super.mouseScrolled(x,y,horizontal,vertical);}
+    private int noticeTop(){return topPos+50;}
+    private int noticeBottom(){return topPos+82;}
+    private boolean overNotice(double mx,double my){return mx>=leftPos+12&&mx<=leftPos+imageWidth-12&&my>=noticeTop()&&my<=noticeBottom();}
+    @Override public boolean mouseClicked(double mx,double my,int button){
+        if(button==0&&overNotice(mx,my)){net.minecraft.Util.getPlatform().openUri(PHONE_APP_URL);return true;}
+        return super.mouseClicked(mx,my,button);
+    }
+    @Override public boolean mouseScrolled(double x,double y,double horizontal,double vertical){if(y>=topPos+197){scroll=Math.max(0,scroll+(int)(vertical*24));return true;}return super.mouseScrolled(x,y,horizontal,vertical);}
     private final class SendChoice extends Screen {
         SendChoice(){super(tr("choose"));}
         @Override protected void init(){int x=width/2-90,y=height/2;addRenderableWidget(Button.builder(tr("maid"),b->{minecraft.setScreen(PlatformScreen.this);sendMaid();}).bounds(x,y-20,180,24).build());addRenderableWidget(Button.builder(tr("house"),b->openHouse()).bounds(x,y+10,180,24).build());}

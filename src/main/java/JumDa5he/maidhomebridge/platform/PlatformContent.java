@@ -1,6 +1,7 @@
 package JumDa5he.maidhomebridge.platform;
 
 import JumDa5he.maidhomebridge.MaidHomeBridge;
+import com.github.tartaricacid.touhoulittlemaid.init.InitCreativeTabs;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.world.inventory.MenuType;
 import net.minecraft.world.item.CreativeModeTabs;
@@ -22,7 +23,7 @@ public final class PlatformContent {
     public static final DeferredHolder<CreativeModeTab, CreativeModeTab> TAB = TABS.register("maidhome", () -> CreativeModeTab.builder()
             .title(Component.translatable("itemGroup.maidhome_bridge"))
             .icon(() -> ITEM.get().getDefaultInstance())
-            .withTabsBefore(CreativeModeTabs.FUNCTIONAL_BLOCKS)
+            .withTabsBefore(InitCreativeTabs.GARAGE_KIT_TAB.getId())
             .displayItems((parameters, output) -> output.accept(ITEM.get()))
             .build());
     public static final DeferredHolder<BlockEntityType<?>, BlockEntityType<PlatformBlockEntity>> ENTITY = ENTITIES.register("transfer_platform",

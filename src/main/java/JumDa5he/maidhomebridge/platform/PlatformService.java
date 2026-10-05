@@ -1,6 +1,7 @@
 package JumDa5he.maidhomebridge.platform;
 
 import JumDa5he.maidhomebridge.MaidHomeBridge;
+import JumDa5he.maidhomebridge.AuthorUtil;
 import JumDa5he.maidhomebridge.network.BridgeNetwork;
 import JumDa5he.maidhomebridge.server.ServerBridge;
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
@@ -24,6 +25,25 @@ public final class PlatformService {
     private static final Map<UUID, Session> TASKS = new HashMap<>();
     private static final String LOCK = "MaidHomePlatformOriginalNoAI";
     private static final ThreadLocal<SpawnContext> SPAWN = new ThreadLocal<>();
+    /** 女仆回到台面时的普通台词，文案在语言文件里，随机取一句。 */
+    private static final List<String> RETURN_LINE_KEYS = List.of(
+            "gui.maidhome_bridge.return.line1",
+            "gui.maidhome_bridge.return.line2",
+            "gui.maidhome_bridge.return.line3",
+            "gui.maidhome_bridge.return.line4",
+            "gui.maidhome_bridge.return.line5",
+            "gui.maidhome_bridge.return.line6",
+            "gui.maidhome_bridge.return.line7",
+            "gui.maidhome_bridge.return.line8",
+            "gui.maidhome_bridge.return.line9",
+            "gui.maidhome_bridge.return.line10"
+    );
+    /** 作者身份的彩蛋台词；语言文件里先留三个空，填好任意一句即生效，全空时回落到普通台词。 */
+    private static final List<String> EASTER_EGG_KEYS = List.of(
+            "gui.maidhome_bridge.return.egg1",
+            "gui.maidhome_bridge.return.egg2",
+            "gui.maidhome_bridge.return.egg3"
+    );
     private PlatformService() {}
     public static final class Session {
         public final UUID id=UUID.randomUUID(), player, station;
@@ -256,11 +276,32 @@ public final class PlatformService {
             if(result.spawned()&&(added==null||!added.isAlive()||player.serverLevel().getEntity(added.getUUID())!=added))throw new IOException("未确认实体进入世界，结果待确认");
             if(result.spawned()) {
                 playTransferSound(added);
-                try {added.getChatBubbleManager().addChatBubble(com.github.tartaricacid.touhoulittlemaid.entity.chatbubble.implement.TextChatBubbleData.type2(net.minecraft.network.chat.Component.literal("主人我回来了，另一个世界也很有趣呢")));}
-                catch(RuntimeException e){org.slf4j.LoggerFactory.getLogger("MaidHomeBridge").warn("女仆已恢复，但欢迎气泡显示失败",e);}
+                speakReturn(added,player);
             }
             return new Arrival(result,result.spawned()?added:null);
         } finally { SPAWN.remove(); }
+    }
+    /** 女仆回到台面后说一句台词；作者身份的玩家会看到彩蛋台词。 */
+    private static void speakReturn(EntityMaid maid,ServerPlayer receiver) {
+        boolean easterEgg = maid.getOwner() instanceof net.minecraft.world.entity.player.Player owner
+                ? AuthorUtil.isLoveWineFoxTV(owner)
+                : receiver != null && AuthorUtil.isLoveWineFoxTV(receiver);
+        List<String> keys = easterEgg ? filledKeys(EASTER_EGG_KEYS) : List.of();
+        if(keys.isEmpty()) keys = RETURN_LINE_KEYS;
+        String key = keys.get(java.util.concurrent.ThreadLocalRandom.current().nextInt(keys.size()));
+        try { maid.getChatBubbleManager().addChatBubble(com.github.tartaricacid.touhoulittlemaid.entity.chatbubble.implement.TextChatBubbleData.type2(net.minecraft.network.chat.Component.translatable(key))); }
+        catch(RuntimeException e){org.slf4j.LoggerFactory.getLogger("MaidHomeBridge").warn("女仆已恢复，但欢迎气泡显示失败",e);}
+    }
+    /** 只保留语言文件里确实填了内容的键；语言未加载或全部留空时返回空表。 */
+    private static List<String> filledKeys(List<String> keys) {
+        List<String> filled = new ArrayList<>();
+        for(String key : keys) {
+            try {
+                String text = net.minecraft.locale.Language.getInstance().getOrDefault(key,"");
+                if(text != null && !text.isBlank()) filled.add(key);
+            } catch(RuntimeException ignored) { }
+        }
+        return filled;
     }
     private static void checkSpace(PlatformBlockEntity p, EntityMaid maid) throws IOException {
         BlockPos pos=p.getBlockPos();
