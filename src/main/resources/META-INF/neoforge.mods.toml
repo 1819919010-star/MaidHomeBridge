@@ -22,7 +22,7 @@ side="BOTH"
 [[dependencies.maidhome_bridge]]
 modId="maid_file_manager"
 type="required"
-versionRange="[1.4.3,)"
+versionRange="[1.4.2,)"
 ordering="AFTER"
 side="BOTH"
 [[dependencies.maidhome_bridge]]

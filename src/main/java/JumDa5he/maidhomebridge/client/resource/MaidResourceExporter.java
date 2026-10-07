@@ -19,6 +19,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.function.Consumer;
 
 public final class MaidResourceExporter {
     private MaidResourceExporter() {}
@@ -79,6 +80,12 @@ public final class MaidResourceExporter {
     }
 
     public static Path export(Snapshot snapshot, byte[] archive, Path destination) throws IOException {
+        return export(snapshot, archive, destination,
+                message -> org.slf4j.LoggerFactory.getLogger("MaidHomeBridge").warn(message));
+    }
+
+    public static Path export(Snapshot snapshot, byte[] archive, Path destination,
+                              Consumer<String> warning) throws IOException {
         ResourceSource source = new ResourceSource(snapshot.resources(), snapshot.packFolder());
         byte[] geometry = source.read(snapshot.model());
         JsonObject model = json(geometry, "模型");
@@ -102,20 +109,21 @@ public final class MaidResourceExporter {
         metadata.addProperty("model", "model.json");
         metadata.addProperty("texture", "texture.png");
         if (snapshot.gecko()) {
-            JsonObject merged = json(source.readGameResource(GeckoModelLoader.DEFAULT_MAID_ANIMATION), "默认动画");
-            if (!merged.has("animations") || !merged.get("animations").isJsonObject())
-                throw new IOException("默认基岩动画缺少 animations");
-            JsonObject animations = merged.getAsJsonObject("animations");
+            JsonObject merged = new JsonObject();
+            merged.addProperty("format_version", "1.8.0");
+            JsonObject animations = new JsonObject();
+            merged.add("animations", animations);
+            mergeAnimation(source, GeckoModelLoader.DEFAULT_MAID_ANIMATION, true, animations, warning);
             for (ResourceLocation animation : snapshot.animations()) {
                 if (animation.equals(GeckoModelLoader.DEFAULT_MAID_ANIMATION)) break;
-                if (!animation.getPath().endsWith(".json")) throw new IOException("不支持非 JSON 动画：" + animation);
-                JsonObject custom = json(source.read(animation), "动画");
-                if (!custom.has("animations") || !custom.get("animations").isJsonObject())
-                    throw new IOException("动画缺少 animations：" + animation);
-                custom.getAsJsonObject("animations").entrySet().forEach(e -> animations.add(e.getKey(), e.getValue()));
+                // Older MoreAnimation packs retain this unpublished animation reference.
+                if (animation.toString().equals("moreanimation:animation/dismember.condition.animation.json")) continue;
+                mergeAnimation(source, animation, false, animations, warning);
             }
-            writeJson(destination, "animation.json", merged);
-            metadata.addProperty("anim", "animation.json");
+            if (!animations.isEmpty()) {
+                writeJson(destination, "animation.json", merged);
+                metadata.addProperty("anim", "animation.json");
+            }
         }
         metadata.addProperty("name", snapshot.name());
         metadata.addProperty("owner_name", snapshot.ownerName());
@@ -126,6 +134,22 @@ public final class MaidResourceExporter {
         metadata.addProperty("sound_freq", snapshot.soundFrequency());
         writeJson(destination, "maid.json", metadata);
         return destination;
+    }
+
+    private static void mergeAnimation(ResourceSource source, ResourceLocation id, boolean gameResource,
+                                       JsonObject animations, Consumer<String> warning) throws IOException {
+        if (!id.getPath().endsWith(".json")) throw new IOException("不支持非 JSON 动画：" + id);
+        byte[] bytes;
+        try {
+            bytes = gameResource ? source.readGameResource(id) : source.read(id);
+        } catch (ResourceSource.MissingResourceException e) {
+            warning.accept("缺少动画资源，已跳过并继续传输，手机端将使用可用动画：" + id);
+            return;
+        }
+        JsonObject custom = json(bytes, "动画 " + id);
+        if (!custom.has("animations") || !custom.get("animations").isJsonObject())
+            throw new IOException("动画缺少 animations：" + id);
+        custom.getAsJsonObject("animations").entrySet().forEach(e -> animations.add(e.getKey(), e.getValue()));
     }
 
     private static JsonObject json(byte[] bytes, String description) throws IOException {

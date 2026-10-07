@@ -274,7 +274,10 @@ public final class BridgeClientService {
             say("女仆档案与模型准备完成");
             checkCancelled();
             Path folder = store.createPackage("maid");
-            MaidResourceExporter.export(snapshot, data.archive(), folder);
+            MaidResourceExporter.export(snapshot, data.archive(), folder, message -> {
+                LOGGER.warn("{}", message);
+                say("警告：" + message);
+            });
             onClient(() -> { MaidResourceExporter.validate(snapshot); return null; });
             checkCancelled(); requireTransferIdle();
             {

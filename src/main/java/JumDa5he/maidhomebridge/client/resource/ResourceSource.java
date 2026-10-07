@@ -13,6 +13,12 @@ import java.util.List;
 import java.util.zip.ZipFile;
 
 final class ResourceSource {
+    static final class MissingResourceException extends IOException {
+        MissingResourceException(ResourceLocation id) {
+            super("客户端缺少资源：" + id);
+        }
+    }
+
     static final int MAX_RESOURCE = 64 * 1024 * 1024;
     private final ResourceManager resources;
     private final List<Path> packs;
@@ -46,7 +52,7 @@ final class ResourceSource {
 
     byte[] readGameResource(ResourceLocation id) throws IOException {
         var resource = resources.getResource(id);
-        if (resource.isEmpty()) throw new IOException("客户端缺少模型资源：" + id);
+        if (resource.isEmpty()) throw new MissingResourceException(id);
         try (InputStream input = resource.get().open()) { return bounded(input); }
     }
 
