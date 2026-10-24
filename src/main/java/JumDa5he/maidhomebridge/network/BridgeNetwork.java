@@ -21,7 +21,8 @@ import java.util.concurrent.*;
 /** Common-side bounded transport. This class has no client Minecraft type references. */
 public final class BridgeNetwork {
     public static final int MAX_ARCHIVE = 512 * 1024;
-    private static final int CHUNK = 24 * 1024, MAX_MESSAGE = 1024 * 1024, MAX_METADATA = 64 * 1024;
+    public static final int MAX_AI = 2 * 1024 * 1024;
+    private static final int CHUNK = 24 * 1024, MAX_MESSAGE = MAX_ARCHIVE + MAX_AI + 64 * 1024, MAX_METADATA = 64 * 1024;
     private static final Gson GSON = new Gson();
     private static final Map<UUID, CompletableFuture<Message>> PENDING = new ConcurrentHashMap<>();
     private static final Map<UUID, Assembly> CLIENT_PARTS = new ConcurrentHashMap<>();
@@ -29,16 +30,18 @@ public final class BridgeNetwork {
     private BridgeNetwork() {}
 
     public record MaidSummary(UUID uuid, String name, String modelId) {}
-    public record ExportResult(byte[] archive, UUID maidUuid, String modelId, String name,
+    public record ExportResult(byte[] archive, byte[] aiChat, UUID maidUuid, String modelId, String name,
                                UUID ownerUuid, String ownerName, String soundId,
                                String scopeId, UUID removalTicket) {}
     public record ImportResult(boolean success, String message) {}
-    public record Message(String operation, JsonObject metadata, byte[] archive) {}
+    public record Message(String operation, JsonObject metadata, byte[] archive, byte[] aiChat) {
+        public Message(String operation, JsonObject metadata, byte[] archive) { this(operation, metadata, archive, new byte[0]); }
+    }
 
     public static void register(IEventBus bus) { bus.addListener(BridgeNetwork::registerPayloads); }
 
     private static void registerPayloads(RegisterPayloadHandlersEvent event) {
-        var registrar = event.registrar("1");
+        var registrar = event.registrar("2");
         registrar.playToServer(Request.TYPE, Request.CODEC, (packet, ctx) -> ctx.enqueueWork(() -> {
             if (!(ctx.player() instanceof ServerPlayer player)) return;
             try {
@@ -81,7 +84,7 @@ public final class BridgeNetwork {
         JsonObject meta = new JsonObject(); meta.addProperty("maid", maid.toString());
         meta.addProperty("transfer",transfer);
         if(platform!=null) meta.add("platform",platform.deepCopy());
-        return request("export", meta, new byte[0]).thenApply(m -> new ExportResult(m.archive(),
+        return request("export", meta, new byte[0]).thenApply(m -> new ExportResult(m.archive(), m.aiChat(),
                 uuid(m.metadata(), "maidUuid"), str(m.metadata(), "modelId"), str(m.metadata(), "name"),
                 uuid(m.metadata(), "ownerUuid"), str(m.metadata(), "ownerName"), str(m.metadata(), "soundId"),
                 str(m.metadata(), "scopeId"), uuid(m.metadata(), "removalTicket")));
@@ -90,10 +93,15 @@ public final class BridgeNetwork {
         return requestImport(archive, receiptKey, null);
     }
     public static CompletableFuture<ImportResult> requestImport(byte[] archive, String receiptKey, JsonObject platform) {
+        return requestImport(archive, receiptKey, platform, new byte[0]);
+    }
+    public static CompletableFuture<ImportResult> requestImport(byte[] archive, String receiptKey, JsonObject platform, byte[] aiChat) {
         if (archive.length == 0 || archive.length > MAX_ARCHIVE) return CompletableFuture.failedFuture(new IOException(".maid 文件大小超限"));
+        if (aiChat != null && aiChat.length > MAX_AI) return CompletableFuture.failedFuture(new IOException("AI 聊天包大小超限"));
         JsonObject meta = new JsonObject(); meta.addProperty("receipt", receiptKey);
         if(platform!=null) meta.add("platform",platform.deepCopy());
-        return request("import", meta, archive).thenApply(m -> new ImportResult(m.metadata().get("success").getAsBoolean(), str(m.metadata(), "message")));
+        return request(new Message("import", meta, archive, aiChat == null ? new byte[0] : aiChat))
+                .thenApply(m -> new ImportResult(m.metadata().get("success").getAsBoolean(), str(m.metadata(), "message")));
     }
     /** Caller must obtain explicit user confirmation and upload.commit.ok first. */
     public static CompletableFuture<ImportResult> requestRemoval(UUID ticket, String committedUploadId) {
@@ -120,11 +128,14 @@ public final class BridgeNetwork {
     }
 
     private static CompletableFuture<Message> request(String operation, JsonObject meta, byte[] archive) {
+        return request(new Message(operation, meta, archive));
+    }
+    private static CompletableFuture<Message> request(Message message) {
         if (PENDING.size() >= 8) return CompletableFuture.failedFuture(new IOException("等待服务端的请求过多"));
         UUID id = UUID.randomUUID(); CompletableFuture<Message> future = new CompletableFuture<>();
         PENDING.put(id, future);
         future.orTimeout(60, TimeUnit.SECONDS).whenComplete((r, e) -> { PENDING.remove(id); CLIENT_PARTS.remove(id); });
-        try { send(new Message(operation, meta, archive), (i, n, b) -> PacketDistributor.sendToServer(new Request(id, i, n, b))); }
+        try { send(message, (i, n, b) -> PacketDistributor.sendToServer(new Request(id, i, n, b))); }
         catch (Exception e) { future.completeExceptionally(e); }
         return future;
     }
@@ -143,9 +154,14 @@ public final class BridgeNetwork {
     private static void send(Message message, ChunkSender sender) throws IOException {
         JsonObject header = message.metadata().deepCopy(); header.addProperty("operation", message.operation());
         byte[] json = GSON.toJson(header).getBytes(StandardCharsets.UTF_8);
-        if (json.length > MAX_METADATA || message.archive().length > MAX_ARCHIVE) throw new IOException("数据超过传输上限");
+        byte[] aiChat = message.aiChat() == null ? new byte[0] : message.aiChat();
+        if (json.length > MAX_METADATA || message.archive().length > MAX_ARCHIVE || aiChat.length > MAX_AI) throw new IOException("数据超过传输上限");
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        try (DataOutputStream out = new DataOutputStream(bytes)) { out.writeInt(json.length); out.write(json); out.writeInt(message.archive().length); out.write(message.archive()); }
+        try (DataOutputStream out = new DataOutputStream(bytes)) {
+            out.writeInt(json.length); out.write(json);
+            out.writeInt(message.archive().length); out.write(message.archive());
+            out.writeInt(aiChat.length); out.write(aiChat);
+        }
         byte[] data = bytes.toByteArray(); int count = (data.length + CHUNK - 1) / CHUNK;
         for (int i = 0; i < count; i++) sender.send(i, count, Arrays.copyOfRange(data, i * CHUNK, Math.min(data.length, (i + 1) * CHUNK)));
     }
@@ -166,8 +182,10 @@ public final class BridgeNetwork {
         try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(assembly.bytes.toByteArray()))) {
             int jsonLength = in.readInt(); if (jsonLength < 0 || jsonLength > MAX_METADATA || jsonLength > in.available()) throw new IOException("元数据超限");
             JsonObject meta = JsonParser.parseString(new String(in.readNBytes(jsonLength), StandardCharsets.UTF_8)).getAsJsonObject();
-            int archiveLength = in.readInt(); if (archiveLength < 0 || archiveLength > MAX_ARCHIVE || archiveLength != in.available()) throw new IOException("归档长度错误");
-            return new Message(str(meta, "operation"), meta, in.readNBytes(archiveLength));
+            int archiveLength = in.readInt(); if (archiveLength < 0 || archiveLength > MAX_ARCHIVE || archiveLength > in.available()) throw new IOException("归档长度错误");
+            byte[] archive = in.readNBytes(archiveLength);
+            int aiLength = in.readInt(); if (aiLength < 0 || aiLength > MAX_AI || aiLength != in.available()) throw new IOException("AI 聊天包长度错误");
+            return new Message(str(meta, "operation"), meta, archive, in.readNBytes(aiLength));
         }
     }
     private static final class Assembly {

@@ -32,11 +32,20 @@ public final class TransferStore {
         return path;
     }
     public Path saveIncoming(String id, byte[] archive, JsonObject begin) throws IOException {
+        return saveIncoming(id, archive, new byte[0], begin);
+    }
+    public Path saveIncoming(String id, byte[] archive, byte[] aiChat, JsonObject begin) throws IOException {
         String hash = SafeFiles.sha256(archive);
         Path folder = SafeFiles.resolve(root, "inbox/" + SafeFiles.id(id) + "/" + hash);
         Path file = SafeFiles.resolve(folder, "maid_data.maid");
         if (Files.exists(file)) SafeFiles.verify(Files.readAllBytes(file), hash);
         else SafeFiles.writeDurable(file, archive);
+        if (aiChat != null && aiChat.length > 0) {
+            String aiHash = SafeFiles.sha256(aiChat);
+            Path aiFile = SafeFiles.resolve(folder, "ai_chat.json.gz");
+            if (Files.exists(aiFile)) SafeFiles.verify(Files.readAllBytes(aiFile), aiHash);
+            else SafeFiles.writeDurable(aiFile, aiChat);
+        }
         writeJson(SafeFiles.resolve(folder, "send.begin.json"), begin);
         return folder;
     }
@@ -45,5 +54,10 @@ public final class TransferStore {
     }
     public static String receiptKey(String id, String hash) {
         return "receive-" + SafeFiles.sha256((id + "\n" + hash).getBytes(StandardCharsets.UTF_8));
+    }
+    /** 无 AI 聊天包时沿用旧键，保证已有去重记录仍然有效。 */
+    public static String receiptKey(String id, String hash, String aiHash) {
+        if (aiHash == null || aiHash.isEmpty()) return receiptKey(id, hash);
+        return "receive-" + SafeFiles.sha256((id + "\n" + hash + "\n" + aiHash).getBytes(StandardCharsets.UTF_8));
     }
 }

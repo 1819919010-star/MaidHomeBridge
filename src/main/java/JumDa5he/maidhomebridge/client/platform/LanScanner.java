@@ -108,12 +108,12 @@ public final class LanScanner {
             socket.setTcpNoDelay(true);
             JsonObject hello = new JsonObject();
             hello.addProperty("op", "hello");
-            hello.addProperty("version", 1);
+            hello.addProperty("version", 2);
             hello.addProperty("client", "maidhome_bridge/scan");
             PortalFrame.write(socket.getOutputStream(), hello, new byte[0]);
             PortalFrame frame = PortalFrame.read(socket.getInputStream());
             if (!"hello.ok".equals(frame.op())) return false;
-            return PortalFrame.integer(frame.header(), "version", -1, Integer.MAX_VALUE) == 1;
+            return PortalFrame.integer(frame.header(), "version", -1, Integer.MAX_VALUE) == 2;
         } catch (IOException | RuntimeException e) {
             return false;
         }

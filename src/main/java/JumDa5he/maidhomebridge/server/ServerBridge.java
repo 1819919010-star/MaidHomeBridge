@@ -1,6 +1,7 @@
 package JumDa5he.maidhomebridge.server;
 
 import JumDa5he.maidhomebridge.network.BridgeNetwork;
+import JumDa5he.maidhomebridge.ai.MaidAiPortable;
 import JumDa5he.maidhomebridge.platform.PlatformService;
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
 import com.google.gson.Gson;
@@ -96,13 +97,14 @@ public final class ServerBridge {
         meta.addProperty("name", maid.hasCustomName() ? maid.getCustomName().getString() : data.getDisplayName());
         meta.addProperty("ownerUuid", player.getUUID().toString()); meta.addProperty("ownerName", player.getGameProfile().getName());
         meta.addProperty("soundId", maid.getSoundPackId()); meta.addProperty("removalTicket", ticket.toString());
+        byte[] aiChat = MaidAiPortable.exportGzip(maid);
         return io(() -> {
             if(transfer&&!TransferPolicy.mayExport(journal.read(journal.receipt(player.getUUID(),"outgoing",maid.getUUID().toString()))))
                 throw new IOException("这只女仆已有提交或待确认记录，请使用 confirm_remove 处理或核对两端，禁止重复上传");
             byte[] archive = MaidFilePackets.serializeMaidFileData(data);
             if (archive == null || archive.length == 0 || archive.length > BridgeNetwork.MAX_ARCHIVE) throw new IOException(".maid 导出失败或大于 512 KiB");
             meta.addProperty("scopeId", journal.scope(player.getUUID()));
-            return new BridgeNetwork.Message("export", meta, archive);
+            return new BridgeNetwork.Message("export", meta, archive, aiChat);
         });
     }
     private static CompletableFuture<BridgeNetwork.Message> importMaid(ServerPlayer player, BridgeNetwork.Message request, ServerJournal journal) {
@@ -110,6 +112,9 @@ public final class ServerBridge {
         return io(() -> {
             byte[] archive = request.archive();
             if (archive.length == 0 || archive.length > BridgeNetwork.MAX_ARCHIVE) throw new IOException(".maid 文件大小无效");
+            byte[] aiChat = request.aiChat() == null ? new byte[0] : request.aiChat();
+            if (aiChat.length > BridgeNetwork.MAX_AI) throw new IOException("AI 聊天包大小无效");
+            if (aiChat.length > 0) MaidAiPortable.validate(aiChat);
             String digest = ServerJournal.hash(archive);
             Path receipt = journal.receipt(playerId, "imports", BridgeNetwork.str(request.metadata(), "receipt"));
             JsonObject existing = journal.read(receipt);
@@ -128,15 +133,16 @@ public final class ServerBridge {
             if (!TransferPolicy.mayReceiveSource(sourceRecord))
                 throw new IOException("此女仆仍在 MC 或上次导入结果待确认；合法移出后才能再次接收");
             JsonObject record = new JsonObject(); record.addProperty("state", "PENDING"); record.addProperty("sha256", digest);
+            if (aiChat.length > 0) record.addProperty("ai_sha256", ServerJournal.hash(aiChat));
             record.addProperty("sourceKey",sourceKey); record.addProperty("sourceMaidUuid", source); record.addProperty("createdAt", System.currentTimeMillis());
             record.addProperty("receiptKey", BridgeNetwork.str(request.metadata(), "receipt"));
             journal.write(sourceReceipt, record);
             journal.write(receipt, record);
-            return new PreparedImport(data, receipt, sourceReceipt, record);
+            return new PreparedImport(data, receipt, sourceReceipt, record, aiChat);
         }).thenCompose(prepared -> onServer(server, () -> {
             requirePlayer(player);
             if(!request.metadata().has("platform"))return new Imported(prepared,false,"请先启用接收台",null);
-            var arrival=PlatformService.importAt(player,request.metadata().getAsJsonObject("platform"),prepared.data);
+            var arrival=PlatformService.importAt(player,request.metadata().getAsJsonObject("platform"),prepared.data,prepared.aiChat);
             return new Imported(prepared,arrival.result().spawned(),arrival.result().message().getString(),arrival.maid()==null?null:arrival.maid().getUUID());
         })).thenCompose(imported -> io(() -> {
             imported.prepared.record.addProperty("state", imported.success ? "SPAWNED" : "REJECTED");
@@ -270,7 +276,7 @@ public final class ServerBridge {
         CompletableFuture<T> result = new CompletableFuture<>(); server.execute(() -> { try { result.complete(task.get()); } catch (Exception e) { result.completeExceptionally(e); } }); return result;
     }
     private record Ticket(UUID player, UUID maid, CompoundTag snapshot, long created, long gameTime) {}
-    private record PreparedImport(MaidFileData data, Path receipt, Path sourceReceipt, JsonObject record) {}
+    private record PreparedImport(MaidFileData data, Path receipt, Path sourceReceipt, JsonObject record, byte[] aiChat) {}
     private record Imported(PreparedImport prepared, boolean success, String message,UUID entity) {}
     private record RemovalRecord(Path path, JsonObject record) {}
 }

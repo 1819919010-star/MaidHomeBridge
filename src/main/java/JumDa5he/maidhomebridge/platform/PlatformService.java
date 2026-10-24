@@ -2,6 +2,7 @@ package JumDa5he.maidhomebridge.platform;
 
 import JumDa5he.maidhomebridge.MaidHomeBridge;
 import JumDa5he.maidhomebridge.AuthorUtil;
+import JumDa5he.maidhomebridge.ai.MaidAiPortable;
 import JumDa5he.maidhomebridge.network.BridgeNetwork;
 import JumDa5he.maidhomebridge.server.ServerBridge;
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
@@ -260,6 +261,9 @@ public final class PlatformService {
     }
     public record Arrival(io.github.zgxhzhr.maidfm.data.ImportResult result,EntityMaid maid) {}
     public static Arrival importAt(ServerPlayer player, JsonObject metadata, MaidFileData data) throws IOException {
+        return importAt(player, metadata, data, new byte[0]);
+    }
+    public static Arrival importAt(ServerPlayer player, JsonObject metadata, MaidFileData data, byte[] aiChat) throws IOException {
         Session s;
         try {
             s=require(player,metadata);
@@ -275,6 +279,7 @@ public final class PlatformService {
             EntityMaid added=ctx.added.isEmpty()?null:ctx.added.getFirst();
             if(result.spawned()&&(added==null||!added.isAlive()||player.serverLevel().getEntity(added.getUUID())!=added))throw new IOException("未确认实体进入世界，结果待确认");
             if(result.spawned()) {
+                if (aiChat != null && aiChat.length > 0) MaidAiPortable.merge(added, aiChat);
                 playTransferSound(added);
                 speakReturn(added,player);
             }

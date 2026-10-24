@@ -184,6 +184,7 @@ public final class BridgeClientService {
             TransferStore storage = store;
             JsonObject record = storage.find(receipt.key());
             record.addProperty("unity_id", receipt.id()); record.addProperty("sha256", receipt.hash());
+            record.addProperty("ai_sha256", receipt.aiHash());
             record.addProperty("directory", receipt.directory().toString());
             if (mode.equals("reject") || mode.equals("save")) {
                 storage.journal(receipt.key(), record, "REJECTED");
@@ -200,7 +201,7 @@ public final class BridgeClientService {
                 storage.journal(receipt.key(), record, "IMPORT_INTENT");
                 unsafeResult = true; remoteRisk = true;
                 BridgeNetwork.ImportResult result;
-                try { result = onClientAsync(() -> BridgeNetwork.requestImport(receipt.archive(), receipt.key(), activePlatform)); }
+                try { result = onClientAsync(() -> BridgeNetwork.requestImport(receipt.archive(), receipt.key(), activePlatform, receipt.aiChat())); }
                 catch (Exception e) {
                     storage.journal(receipt.key(), record, "IMPORT_RESULT_UNCERTAIN");
                     client.acknowledge(receipt.id(), false, "导入结果待确认，保留 Unity 档案"); receiving.clear();
@@ -278,6 +279,10 @@ public final class BridgeClientService {
                 LOGGER.warn("{}", message);
                 say("警告：" + message);
             });
+            if (data.aiChat() != null && data.aiChat().length > 0) {
+                SafeFiles.writeDurable(folder.resolve("ai_chat.json.gz"), data.aiChat());
+                say("AI 人设与聊天记录已打包");
+            }
             onClient(() -> { MaidResourceExporter.validate(snapshot); return null; });
             checkCancelled(); requireTransferIdle();
             {
