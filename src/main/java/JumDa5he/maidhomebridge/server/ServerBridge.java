@@ -11,11 +11,13 @@ import io.github.zgxhzhr.maidfm.network.MaidFilePackets;
 import io.github.zgxhzhr.maidfm.service.MaidTransferService;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.storage.LevelResource;
 import net.neoforged.neoforge.items.IItemHandler;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
@@ -115,18 +117,39 @@ public final class ServerBridge {
             byte[] aiChat = request.aiChat() == null ? new byte[0] : request.aiChat();
             if (aiChat.length > BridgeNetwork.MAX_AI) throw new IOException("AI 聊天包大小无效");
             if (aiChat.length > 0) MaidAiPortable.validate(aiChat);
-            String digest = ServerJournal.hash(archive);
-            Path receipt = journal.receipt(playerId, "imports", BridgeNetwork.str(request.metadata(), "receipt"));
+            MaidFileData data = MaidFilePackets.deserializeMaidFileData(archive);
+            if (data == null || data.getData() == null) throw new IOException("MaidFileManager 无法读取归档");
+            String receiptKey = BridgeNetwork.str(request.metadata(), "receipt");
+            Path receipt = journal.receipt(playerId, "imports", receiptKey);
             JsonObject existing = journal.read(receipt);
+            String source = data.getSourceMaidUuid();
+            if (source == null && data.getData().hasUUID("UUID")) source = data.getData().getUUID("UUID").toString();
+            UUID replacement = null;
+            if (existing != null && existing.has("reassigned_uuid")) {
+                replacement = UUID.fromString(BridgeNetwork.str(existing, "reassigned_uuid"));
+            } else if (source != null) {
+                UUID sourceUuid = null;
+                try { sourceUuid = UUID.fromString(source); } catch (IllegalArgumentException ignored) { }
+                if (sourceUuid != null) {
+                    JsonObject priorSource = journal.read(journal.receipt(playerId, "sources", "maid-uuid:" + source));
+                    if (uuidInUse(server, sourceUuid) || !TransferPolicy.mayReceiveSource(priorSource))
+                        replacement = UUID.nameUUIDFromBytes((source + "\n" + receiptKey + "\nmaidhome-reassign").getBytes(StandardCharsets.UTF_8));
+                }
+            }
+            if (replacement != null) {
+                data.setSourceMaidUuid(replacement.toString());
+                data.getData().putUUID("UUID", replacement);
+                archive = MaidFilePackets.serializeMaidFileData(data);
+                if (archive == null || archive.length == 0 || archive.length > BridgeNetwork.MAX_ARCHIVE)
+                    throw new IOException("女仆 UUID 重分配后重新导出失败");
+                source = replacement.toString();
+            }
+            String digest = ServerJournal.hash(archive);
             if (existing != null) {
                 if (!digest.equals(BridgeNetwork.str(existing, "sha256"))) throw new IOException("接收 ID 已存在但文件校验值不同");
                 // A restart may have interrupted world saving. Never claim a prior spawn persisted merely from a disk receipt.
                 if (!TransferPolicy.mayReceiveTransaction(existing)) throw new IOException("此接收记录已经处理或处于待确认状态，请核对世界中的女仆和本地接收文件，禁止盲目再次导入");
             }
-            MaidFileData data = MaidFilePackets.deserializeMaidFileData(archive);
-            if (data == null || data.getData() == null) throw new IOException("MaidFileManager 无法读取归档");
-            String source = data.getSourceMaidUuid();
-            if (source == null && data.getData().hasUUID("UUID")) source = data.getData().getUUID("UUID").toString();
             String sourceKey = source == null ? "legacy-sha256:" + digest : "maid-uuid:" + source;
             Path sourceReceipt = journal.receipt(playerId, "sources", sourceKey);
             JsonObject sourceRecord = journal.read(sourceReceipt);
@@ -134,8 +157,9 @@ public final class ServerBridge {
                 throw new IOException("此女仆仍在 MC 或上次导入结果待确认；合法移出后才能再次接收");
             JsonObject record = new JsonObject(); record.addProperty("state", "PENDING"); record.addProperty("sha256", digest);
             if (aiChat.length > 0) record.addProperty("ai_sha256", ServerJournal.hash(aiChat));
+            if (replacement != null) record.addProperty("reassigned_uuid", replacement.toString());
             record.addProperty("sourceKey",sourceKey); record.addProperty("sourceMaidUuid", source); record.addProperty("createdAt", System.currentTimeMillis());
-            record.addProperty("receiptKey", BridgeNetwork.str(request.metadata(), "receipt"));
+            record.addProperty("receiptKey", receiptKey);
             journal.write(sourceReceipt, record);
             journal.write(receipt, record);
             return new PreparedImport(data, receipt, sourceReceipt, record, aiChat);
@@ -251,6 +275,10 @@ public final class ServerBridge {
     }
     private static void requirePlayer(ServerPlayer player) throws IOException {
         if (player.getServer() == null || player.getServer().getPlayerList().getPlayer(player.getUUID()) != player || !player.isAlive()) throw new IOException("玩家已离线或无法操作");
+    }
+    private static boolean uuidInUse(MinecraftServer server, UUID id) {
+        for (ServerLevel level : server.getAllLevels()) if (level.getEntity(id) != null) return true;
+        return false;
     }
     private static boolean empty(IItemHandler inventory) {
         for (int i = 0; i < inventory.getSlots(); i++) if (!inventory.getStackInSlot(i).isEmpty()) return false;
